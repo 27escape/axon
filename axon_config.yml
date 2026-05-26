@@ -1,0 +1,46 @@
+# Configuration file for your home lab servers
+commands:
+  - name: "update"
+    command: 'sudo sh -c "apt update && apt upgrade -y && apt autoremove -y"'
+    tags: ["linux", "pi"]
+  - name: "ping"
+    command: 'echo "pong"'
+    tags: ["linux", "pi", "mac"]
+  - name: "brew-update"
+    command: 'brew upgrade'
+    tags: ["mac"]
+servers:
+  - name: "photos.local"
+    ip: "192.168.0.172"
+    user: "kevinmu"
+    active: true
+    tags:
+      - pi
+      - linux
+  - name: "backup.local"
+    ip: "192.168.0.145"
+    user: "kevinmu"
+    active: true
+    tags:
+      - pi
+      - linux
+  - name: "micro.local"
+    ip: "192.168.0.99"
+    user: "kevinmu"
+    active: false
+    tags:
+      - pi
+      - linux
+  - name: "homeassistant.local"
+    ip: "192.168.0.222"
+    user: "kevinmu"
+    active: true
+    tags:
+      - pi
+      - linux
+  - name: "Backup-Server.local"
+    ip: "192.168.0.70"
+    user: "kevinmu"
+    active: false # This will be skipped automatically
+    tags:
+      - linux

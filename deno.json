@@ -1,0 +1,71 @@
+{
+  "imports": {
+    "yaml": "https://deno.land/std@0.224.0/yaml/mod.ts",
+    "@cliffy/prompt/secret": "https://deno.land/x/cliffy@v1.0.0-rc.4/prompt/secret.ts",
+    "@cliffy/ansi/colors": "https://deno.land/x/cliffy@v1.0.0-rc.4/ansi/colors.ts",
+    "@cliffy/command": "https://deno.land/x/cliffy@v1.0.0-rc.4/command/mod.ts"
+  },
+
+  "compilerOptions": {
+    "lib": ["deno.window",  "deno.ns",  "deno.unstable"],
+    "strict": true
+  },
+
+  "include": ["./", "./bin", "./lib"],
+  "exclude": [ "./dist", "./off"],
+
+  "nodeModulesDir": "auto",
+
+  "lint": {
+    "rules": {
+      "tags": ["recommended"],
+      "include": ["ban-untagged-todo"],
+      "exclude": ["no-unused-vars"]
+    }
+  },
+
+  "fmt": {
+    "useTabs": false,
+    "lineWidth": 120,
+    "indentWidth": 4,
+    "semiColons": true,
+    "singleQuote": true,
+    "proseWrap": "preserve"
+  },
+
+  "tasks": {
+    "test": {
+      "command": "echo 'run tests'"
+    },
+    "clean": {
+      "command": "echo cleaning && rm -rf dist"
+    },
+
+    "compile:axon": "deno_compile.sh --flags='-RWESI' -r axon.ts",
+    "compile:all": {
+      "description": "build for the current platform target",
+      "command": "echo compile everything",
+      "dependencies": [
+        "compile:axon"
+      ]
+    },
+
+
+    "install": {
+      "description": "install built scripts to users bin dir",
+      "command": "/bin/cp -av dist/* $HOME/bin",
+      "dependencies": ["test", "compile:all"]
+    },
+    "install:clean": {
+      "description": "install cleanly built scripts to users bin dir",
+      "command": "/bin/cp -av dist/* $HOME/bin",
+      "dependencies": ["clean", "install"]
+    }
+
+  },
+  "allowScripts": {
+    "allow": [],
+    "deny": []
+  }
+}
+

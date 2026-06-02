@@ -1,6 +1,7 @@
 # Configuration file for your home lab servers
 commands:
   - name: "update"
+    aliases: ["upgrade"]  
     command: 'sudo sh -c "apt update && apt upgrade -y && apt autoremove -y"'
     tags: ["linux", "pi"]
   - name: "ping"

@@ -56,6 +56,7 @@ Example Configuration:
 ```yaml
 commands:
   - name: "update"
+    aliases: [ "upgrade"]
     command: 'sudo sh -c "apt update && apt upgrade -y && apt autoremove -y"'
     tags: ["linux", "pi"]
   - name: "ping"

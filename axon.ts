@@ -9,6 +9,7 @@ import { colors, Command, parseYaml, Secret } from "./deps.ts";
 
 interface CommandConfig {
   name: string;
+  aliases: string[];
   command: string;
   tags: string[];
 }
@@ -397,9 +398,15 @@ async function main() {
     const parsedData = parseYaml(rawYaml) as YamlConfig;
 
     // 3. Validate Command Availability
-    const cmdConfig = parsedData.commands.find((c) =>
+    let cmdConfig = parsedData.commands.find((c) =>
       c.name === requestedCommandName
     );
+
+    if( !cmdConfig) {
+      cmdConfig = parsedData.commands.find((c) =>
+        c.aliases.includes(requestedCommandName)
+      );
+    }
 
     if (!cmdConfig) {
       console.error(

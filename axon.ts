@@ -50,7 +50,7 @@ let IS_VERBOSE = false;
 // Dynamic Environment Variables
 const USER = Deno.env.get("USER") || "default";
 const HOME = Deno.env.get("HOME") || "/root";
-const LOG_DIR = `/tmp/axon_${USER}`;
+const LOG_DIR = `/tmp/${USER}/axon`;
 const AXON_LOG = "axon" 
 
 // Ensure the log directory exists

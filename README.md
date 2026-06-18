@@ -57,6 +57,7 @@ Example Configuration:
 commands:
   - name: "update"
     aliases: [ "upgrade"]
+    check_command: 'check_command: test $(apt list --upgradable 2>/dev/null | wc -l) -le 1'
     command: 'sudo sh -c "apt update && apt upgrade -y && apt autoremove -y"'
     tags: ["linux", "pi"]
   - name: "ping"
@@ -65,6 +66,10 @@ commands:
   - name: "brew-update"
     command: 'brew upgrade'
     tags: ["mac"]
+  - name: install-nginx
+    check_command: dpkg -l | grep -q nginx
+    command: sudo apt-get install -y nginx
+    tags: [webservers]
 
 servers:
   - name: "photos.local"
@@ -78,6 +83,8 @@ servers:
     active: true
     tags: ["mac"]
 ```
+
+Note that it is possible to check if a command needs to be run, this is useful if the command may take a long time. This is the purpose of the `check_command` entry, if it returns true (0) then the command would not be actioned, otherwise it will be. For simple commands such as `ping` we do not need, or want, to use this pre-check.
 
 ## Usage
 

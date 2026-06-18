@@ -9,7 +9,7 @@ import { colors, Command, parseYaml, Secret } from "./deps.ts";
 
 interface CommandConfig {
   name: string;
-  aliases: string[];
+  aliases?: string[];
   command: string;
   tags: string[];
 }
@@ -27,15 +27,227 @@ interface YamlConfig {
   servers: ServerConfig[];
 }
 
+function validateYamlConfig(data: unknown, source: string): asserts data is YamlConfig {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    fatal(
+      `Error: Invalid YAML structure in ${source}. ` +
+      `Expected an object with 'commands' and 'servers'.`,
+    );
+  }
+
+  const root = data as Record<string, unknown>;
+
+  if (!Array.isArray(root.commands)) {
+    fatal(`Error: Invalid configuration in ${source}: 'commands' must be a list.`);
+  }
+
+  if (!Array.isArray(root.servers)) {
+    fatal(`Error: Invalid configuration in ${source}: 'servers' must be a list.`);
+  }
+
+  root.commands.forEach((command, index) => {
+    if (!command || typeof command !== "object" || Array.isArray(command)) {
+      fatal(`Error: Command entry at index ${index} in ${source} is malformed.`);
+    }
+
+    const cmd = command as Record<string, unknown>;
+
+    if (typeof cmd.name !== "string" || cmd.name.trim() === "") {
+      fatal(`Error: Command entry at index ${index} in ${source} must have a non-empty 'name'.`);
+    }
+
+    if (typeof cmd.command !== "string" || cmd.command.trim() === "") {
+      fatal(`Error: Command '${cmd.name ?? index}' must have a non-empty 'command'.`);
+    }
+
+    if (!Array.isArray(cmd.tags) || cmd.tags.some((tag) => typeof tag !== "string")) {
+      fatal(`Error: Command '${cmd.name}' must have a 'tags' array of strings.`);
+    }
+
+    if (cmd.aliases !== undefined && !Array.isArray(cmd.aliases)) {
+      fatal(`Error: Command '${cmd.name}' has invalid 'aliases'; expected a list of strings.`);
+    }
+  });
+
+  root.servers.forEach((server, index) => {
+    if (!server || typeof server !== "object" || Array.isArray(server)) {
+      fatal(`Error: Server entry at index ${index} in ${source} is malformed.`);
+    }
+
+    const srv = server as Record<string, unknown>;
+
+    if (typeof srv.name !== "string" || srv.name.trim() === "") {
+      fatal(`Error: Server entry at index ${index} in ${source} must have a non-empty 'name'.`);
+    }
+
+    if (typeof srv.ip !== "string" || srv.ip.trim() === "") {
+      fatal(`Error: Server '${srv.name}' must have a non-empty 'ip'.`);
+    }
+
+    if (typeof srv.user !== "string" || srv.user.trim() === "") {
+      fatal(`Error: Server '${srv.name}' must have a non-empty 'user'.`);
+    }
+
+    if (typeof srv.active !== "boolean") {
+      fatal(`Error: Server '${srv.name}' must have an 'active' boolean flag.`);
+    }
+
+    if (!Array.isArray(srv.tags) || srv.tags.some((tag) => typeof tag !== "string")) {
+      fatal(`Error: Server '${srv.name}' must have a 'tags' array of strings.`);
+    }
+  });
+}
+
+function listAvailableCommands(parsedData: YamlConfig, options: {
+  server?: string;
+  tag?: string;
+}): void {
+  const byServer = options.server !== undefined;
+  const byTag = options.tag !== undefined;
+
+  let validServer: ServerConfig | undefined;
+  let filteredCommands: CommandConfig[] = parsedData.commands;
+  let serverNamesForTag: string[] = [];
+
+  if (byServer) {
+    validServer = parsedData.servers.find((s) => s.name === options.server);
+    if (!validServer) {
+      fatal(`Error: Server '${options.server}' not found in configuration.`);
+    }
+
+    filteredCommands = parsedData.commands.filter((cmd) =>
+      cmd.tags.some((tag) => validServer!.tags.includes(tag))
+    );
+  }
+
+  if (byTag) {
+    filteredCommands = parsedData.commands.filter((cmd) =>
+      cmd.tags.includes(options.tag!) &&
+        (!byServer || cmd.tags.some((tag) => validServer!.tags.includes(tag)))
+    );
+
+    serverNamesForTag = parsedData.servers
+      .filter((server) => server.tags.includes(options.tag!))
+      .map((server) => server.name);
+  }
+
+  const title = byServer
+    ? `Valid commands for server '${validServer!.name}'` 
+    : byTag
+    ? `Valid commands for tag '${options.tag}'`
+    : "Available commands";
+
+  console.log(colors.bold.cyan(`\n=== ${title} ===\n`));
+
+  if (byServer && validServer) {
+    console.log(
+      colors.gray(
+        `Server tags: ${validServer.tags.join(", ")}`,
+      ),
+    );
+    console.log();
+  }
+
+  if (byTag) {
+    console.log(
+      colors.gray(
+        `Matching servers: ${serverNamesForTag.length > 0
+          ? serverNamesForTag.join(", ")
+          : "None"}`,
+      ),
+    );
+    console.log();
+  }
+
+  if (filteredCommands.length === 0) {
+    console.log(colors.yellow("No commands match the requested criteria."));
+    Deno.exit(0);
+  }
+
+  filteredCommands.forEach((cmd) => {
+    const aliasText = cmd.aliases?.length
+      ? ` (aliases: ${cmd.aliases.join(", ")})`
+      : "";
+
+    const validTags = byServer && validServer
+      ? cmd.tags.filter((tag) => validServer!.tags.includes(tag))
+      : cmd.tags;
+
+    const serversForCommand = byTag
+      ? parsedData.servers
+        .filter((server) => server.tags.includes(options.tag!))
+        .map((server) => server.name)
+      : [];
+
+    console.log(colors.bold(cmd.name) + aliasText);
+    console.log(`  Tags: ${validTags.join(", ")}`);
+
+    if (byTag && serversForCommand.length > 0) {
+      console.log(`  Servers: ${serversForCommand.join(", ")}`);
+    }
+
+    console.log();
+  });
+}
+
+function listAvailableServers(parsedData: YamlConfig, options: {
+  server?: string;
+  tag?: string;
+}): void {
+  const byServer = options.server !== undefined;
+  const byTag = options.tag !== undefined;
+
+  let validServer: ServerConfig | undefined;
+  let filteredServers: ServerConfig[] = parsedData.servers;
+
+  if (byServer) {
+    validServer = parsedData.servers.find((s) => s.name === options.server);
+    if (!validServer) {
+      fatal(`Error: Server '${options.server}' not found in configuration.`);
+    }
+
+    filteredServers = [validServer];
+  }
+
+  if (byTag) {
+    filteredServers = filteredServers.filter((server) =>
+      server.tags.includes(options.tag!),
+    );
+  }
+
+  const title = byServer && byTag
+    ? `Server '${options.server}' matching tag '${options.tag}'`
+    : byServer
+    ? `Server '${options.server}'`
+    : byTag
+    ? `Servers with tag '${options.tag}'`
+    : "Available servers";
+
+  console.log(colors.bold.cyan(`\n=== ${title} ===\n`));
+
+  if (filteredServers.length === 0) {
+    console.log(colors.yellow("No servers match the requested criteria."));
+    Deno.exit(0);
+  }
+
+  filteredServers.forEach((server) => {
+    console.log(colors.bold(server.name));
+    console.log(`  IP: ${server.ip}`);
+    console.log(`  User: ${server.user}`);
+    console.log(`  Active: ${server.active ? "yes" : "no"}`);
+    console.log(`  Tags: ${server.tags.join(", ")}`);
+    console.log();
+  });
+}
+
 interface ServerStatus {
   config: ServerConfig;
   status:
-    | "Checking Keys..."
-    | "Password Cached"
-    | "Running"
     | "Success"
     | "Failed"
-    | "Skipped";
+    | "Skipped"
+    | "Offline";
+  currentPhase: "Pinging" | "Checking SSH" | "Running";
   password?: string;
   outputBuffer: string[];
 }
@@ -51,7 +263,20 @@ let IS_VERBOSE = false;
 const USER = Deno.env.get("USER") || "default";
 const HOME = Deno.env.get("HOME") || "/root";
 const LOG_DIR = `/tmp/${USER}/axon`;
-const AXON_LOG = "axon" 
+// Fix 1: AXON_LOG was missing the .log extension, causing the orchestrator log
+// to be written to a file named "axon" while per-server logs get ".log" appended
+// in logToFile. Now both are consistent.
+const AXON_LOG = "axon.log";
+
+/**
+ * Prints an error message and exits. Typed as never so TypeScript understands
+ * that code after a fatal() call is unreachable, preventing false undefined
+ * narrowing on variables guarded by these checks.
+ */
+function fatal(message: string): never {
+  console.error(colors.red(message));
+  Deno.exit(1);
+}
 
 // Ensure the log directory exists
 try {
@@ -85,8 +310,8 @@ const LAYOUT = {
   boxWidth: 55,
   boxHeight: 10,
   logRows: 6,
-  startX: (col: number) => col * (LAYOUT.boxWidth + 2) + 2,
-  startY: (row: number) => 4 + row * (LAYOUT.boxHeight + 1),
+  startX: (col: number) => col * (LAYOUT.boxWidth - 1) + 1,
+  startY: (row: number) => 1 + row * (LAYOUT.boxHeight - 1),
 };
 
 function calculateLayout(serverCount: number): void {
@@ -97,15 +322,18 @@ function calculateLayout(serverCount: number): void {
     const gridRows = Math.ceil(serverCount / LAYOUT.cols);
 
     const availableWidth = columns - 2;
-    const availableHeight = rows - 4;
+    const availableHeight = rows;
 
-    LAYOUT.boxWidth = Math.floor(availableWidth / LAYOUT.cols) - 1;
-    LAYOUT.boxHeight = Math.floor(availableHeight / gridRows) - 1;
+    // Compute outer box width so adjacent boxes share a single border column
+    LAYOUT.boxWidth = Math.floor((availableWidth + (LAYOUT.cols - 1)) / LAYOUT.cols);
+
+    // Compute outer box height so adjacent boxes share a single border row
+    LAYOUT.boxHeight = Math.floor((availableHeight + (gridRows - 1)) / gridRows);
 
     if (LAYOUT.boxWidth < 40) LAYOUT.boxWidth = 40;
     if (LAYOUT.boxHeight < 7) LAYOUT.boxHeight = 7;
 
-    LAYOUT.logRows = LAYOUT.boxHeight - 4;
+    LAYOUT.logRows = Math.max(0, LAYOUT.boxHeight - 4);
   } catch (_e) {
     // Fallback securely to default geometries
   }
@@ -124,6 +352,30 @@ const Terminal = {
   clearScreen: () => Terminal.write("\x1b[2J"),
   moveTo: (x: number, y: number) => Terminal.write(`\x1b[${y};${x}H`),
 };
+
+/**
+ * Sends a single ICMP ping to the server. Returns true if the host responds,
+ * false if unreachable or the ping binary is unavailable.
+ * Uses -W 2 (Linux) / -W 2000 (macOS) timeout; -c 1 sends a single packet.
+ */
+async function pingHost(server: ServerConfig): Promise<boolean> {
+  // macOS uses milliseconds for -W, Linux uses seconds — detect via platform
+  const isMac = Deno.build.os === "darwin";
+  const timeoutArg = isMac ? "2000" : "2";
+
+  try {
+    const command = new Deno.Command("ping", {
+      args: ["-c", "1", "-W", timeoutArg, server.ip],
+      stdout: "null",
+      stderr: "null",
+    });
+    const { success } = await command.output();
+    return success;
+  } catch (_e) {
+    // ping binary not found or other OS error — fail open and let SSH decide
+    return true;
+  }
+}
 
 async function testSshKeyAuth(server: ServerConfig): Promise<boolean> {
   const command = new Deno.Command("ssh", {
@@ -147,68 +399,79 @@ function drawStaticLayout(servers: ServerStatus[]): void {
   Terminal.clearScreen();
   Terminal.hideCursor();
 
-  Terminal.moveTo(1, 1);
-  Terminal.write(
-    `${
-      colors.bold.cyan("=== Axon: Parallel Command Execution Dashboard ===")
-    }\n`,
-  );
-  Terminal.write(
-    `${
-      colors.gray(
-        `Running [${TARGET_COMMAND_NAME}] on [${TARGET_SCOPE}]: ${TARGET_COMMAND}`,
-      )
-    }\n`,
-  );
+  const cols = LAYOUT.cols;
+  const rows = Math.ceil(servers.length / cols);
+  const innerW = LAYOUT.boxWidth - 2;
 
-  servers.forEach((_, index) => {
-    const col = index % LAYOUT.cols;
-    const row = Math.floor(index / LAYOUT.cols);
+  for (let r = 0; r < rows; r++) {
+    const topY = LAYOUT.startY(r);
 
-    const startX = LAYOUT.startX(col);
-    const startY = LAYOUT.startY(row);
-
-    const horizontalBorder = "═".repeat(LAYOUT.boxWidth - 2);
-
-    Terminal.moveTo(startX, startY);
-    Terminal.write(`╔${horizontalBorder}╗`);
-
-    Terminal.moveTo(startX, startY + LAYOUT.boxHeight - 1);
-    Terminal.write(`╚${horizontalBorder}╝`);
-
-    for (let h = 1; h < LAYOUT.boxHeight - 1; h++) {
-      Terminal.moveTo(startX, startY + h);
-      Terminal.write("║");
-      Terminal.moveTo(startX + LAYOUT.boxWidth - 1, startY + h);
-      Terminal.write("║");
+    // Build top border for the whole row
+    let topLine = "";
+    for (let c = 0; c < cols; c++) {
+      if (c === 0) topLine += "╔" + "═".repeat(innerW);
+      else topLine += "╦" + "═".repeat(innerW);
     }
-  });
+    topLine += "╗";
+    Terminal.moveTo(1, topY);
+    Terminal.write(topLine);
+
+    // Middle content rows
+    for (let h = 1; h < LAYOUT.boxHeight - 1; h++) {
+      let midLine = "";
+      for (let c = 0; c < cols; c++) {
+        midLine += "║" + " ".repeat(innerW);
+      }
+      midLine += "║";
+      Terminal.moveTo(1, topY + h);
+      Terminal.write(midLine);
+    }
+
+    // Bottom border for the row
+    let bottomLine = "";
+    for (let c = 0; c < cols; c++) {
+      if (c === 0) bottomLine += "╚" + "═".repeat(innerW);
+      else bottomLine += "╩" + "═".repeat(innerW);
+    }
+    bottomLine += "╝";
+    Terminal.moveTo(1, topY + LAYOUT.boxHeight - 1);
+    Terminal.write(bottomLine);
+  }
 }
 
 function updateGridCell(server: ServerStatus, index: number): void {
   const col = index % LAYOUT.cols;
   const row = Math.floor(index / LAYOUT.cols);
 
-  const startX = LAYOUT.startX(col) + 2;
+    const startX = LAYOUT.startX(col) + 1;
   const startY = LAYOUT.startY(row) + 1;
-  const innerWidth = LAYOUT.boxWidth - 4;
+    const innerWidth = LAYOUT.boxWidth - 2;
 
   let statusColor = colors.yellow;
   if (server.status === "Success") statusColor = colors.green;
   if (server.status === "Failed") statusColor = colors.red;
-  if (server.status === "Running") statusColor = colors.cyan;
   if (server.status === "Skipped") statusColor = colors.gray;
+  if (server.status === "Offline") statusColor = colors.red;
+
+  let phaseText = server.currentPhase;
+  if (server.status !== "Success" && server.status !== "Failed" && server.status !== "Skipped" && server.status !== "Offline") {
+    phaseText = server.currentPhase;
+  } else {
+    phaseText = server.status;
+  }
 
   const headerText = `${colors.bold(server.config.name)} (${server.config.ip})`;
-  const statusText = `Status: ${statusColor(server.status)}`;
+  const statusText = `${statusColor(phaseText)}`;
+  const combinedHeader = `${headerText} ${statusText}`;
 
   Terminal.moveTo(startX, startY);
-  Terminal.write(headerText.padEnd(innerWidth));
+  let safeHeader = combinedHeader;
+  if (safeHeader.length > innerWidth) {
+    safeHeader = safeHeader.substring(0, innerWidth - 3) + "...";
+  }
+  Terminal.write(safeHeader.padEnd(innerWidth));
 
   Terminal.moveTo(startX, startY + 1);
-  Terminal.write(statusText.padEnd(innerWidth));
-
-  Terminal.moveTo(startX, startY + 2);
   Terminal.write("─".repeat(innerWidth));
 
   const logsToDisplay = server.outputBuffer.slice(-LAYOUT.logRows);
@@ -223,7 +486,7 @@ function updateGridCell(server: ServerStatus, index: number): void {
       cleanLine = cleanLine.substring(0, innerWidth - 3) + "...";
     }
 
-    Terminal.moveTo(startX, startY + 3 + lineIndex);
+      Terminal.moveTo(startX, startY + 2 + lineIndex);
     Terminal.write(colors.gray(cleanLine.padEnd(innerWidth)));
   });
 }
@@ -249,18 +512,53 @@ async function isSshpassInstalled(): Promise<boolean> {
   }
 }
 
-async function executeSshTask(server: ServerStatus): Promise<void> {
-  if (server.status === "Skipped") return;
+async function executeServerTask(server: ServerStatus): Promise<void> {
+  if (server.status === "Skipped" || server.status === "Offline") return;
 
-  server.status = "Running";
+  // Phase 1: Ping the host
+  server.currentPhase = "Pinging";
   await logToFile(
     server.config.name,
     `--- Starting Command [${TARGET_COMMAND_NAME}] ---`,
   );
 
+  const isOnline = await pingHost(server.config);
+  if (!isOnline) {
+    server.status = "Offline";
+    server.outputBuffer.push("Host unreachable (ping failed).");
+    await logToFile(server.config.name, `Reason: Host did not respond to ping.`);
+    return;
+  }
+
+  // Phase 2: Check SSH auth
+  server.currentPhase = "Checking SSH";
+  const hasKey = await testSshKeyAuth(server.config);
+
+  if (!hasKey && !server.password) {
+    server.status = "Skipped";
+    server.outputBuffer.push("Skipped: Authentication required.");
+    await logToFile(
+      server.config.name,
+      `Reason: Node requires interactive password authentication.`,
+    );
+    return;
+  }
+
+  if (hasKey) {
+    server.outputBuffer.push("SSH Key verified.");
+  }
+
+  // Phase 3: Execute the command
+  server.currentPhase = "Running";
+
+  // Fix 2: StrictHostKeyChecking=no silently accepts any host key, including
+  // changed ones, making it vulnerable to MITM attacks. accept-new only
+  // auto-accepts genuinely new (never-seen) hosts, and still rejects changed
+  // keys — a meaningful security improvement with no practical downside for
+  // typical fleet management.
   let baseArgs = [
     "-o",
-    "StrictHostKeyChecking=no",
+    "StrictHostKeyChecking=accept-new",
     "-o",
     "ConnectTimeout=10",
     `${server.config.user}@${server.config.ip}`,
@@ -338,8 +636,11 @@ async function main() {
     // 1. Initialize CLI Command Parser
     const { options, args } = await new Command()
       .name("axon")
-      .description("Run commands on multiple servers")
-      .arguments("<command_name:string>")
+      .description(`Run commands on multiple servers, provide the command or one of these special commands
+'commands' list available commands and their tags
+'servers'  list available servers and their tags       
+`)
+      .arguments('<command_name:string>')
       .option(
         "-c, --config <file:string>",
         "Path to the YAML configuration file",
@@ -363,13 +664,8 @@ async function main() {
       )
       .parse(Deno.args);
 
-    if (options.tag && options.server) {
-      console.error(
-        colors.red(
-          "Error: Cannot use both --tag and --server simultaneously. Please choose one.",
-        ),
-      );
-      Deno.exit(1);
+    if (options.tag && options.server && args[0] !== "commands" && args[0] !== "servers") {
+      fatal("Error: Cannot use both --tag and --server simultaneously. Please choose one.");
     }
 
     IS_UNATTENDED = !!options.unattended;
@@ -382,39 +678,42 @@ async function main() {
     try {
       rawYaml = await Deno.readTextFile(CONFIG_FILE);
     } catch (_err) {
-      console.error(
-        colors.red(
-          `Error: Could not read configuration file at ${CONFIG_FILE}`,
-        ),
+      fatal(
+        `Error: Could not read configuration file at ${CONFIG_FILE}\n` +
+        `Please ensure the file exists or pass a valid path using -c/--config`,
       );
-      console.error(
-        colors.yellow(
-          `Please ensure the file exists or pass a valid path using -c/--config`,
-        ),
-      );
-      Deno.exit(1);
     }
 
-    const parsedData = parseYaml(rawYaml) as YamlConfig;
+    const parsedData = parseYaml(rawYaml);
+    validateYamlConfig(parsedData, CONFIG_FILE);
+
+    if (requestedCommandName === "commands") {
+      listAvailableCommands(parsedData, {
+        server: options.server,
+        tag: options.tag,
+      });
+      return;
+    }
+
+    if (requestedCommandName === "servers") {
+      listAvailableServers(parsedData, {
+        server: options.server,
+        tag: options.tag,
+      });
+      return;
+    }
 
     // 3. Validate Command Availability
-    let cmdConfig = parsedData.commands.find((c) =>
-      c.name === requestedCommandName
+    const cmdConfig = parsedData.commands.find((c) =>
+      c.name === requestedCommandName ||
+        (c.aliases?.includes(requestedCommandName) ?? false)
     );
 
-    if( !cmdConfig) {
-      cmdConfig = parsedData.commands.find((c) =>
-        c.aliases.includes(requestedCommandName)
-      );
-    }
-
     if (!cmdConfig) {
-      console.error(
-        colors.red(
-          `Error: Command '${requestedCommandName}' not found in ${CONFIG_FILE}`,
-        ),
+      fatal(
+        `Error: Command '${requestedCommandName}' not found in ${CONFIG_FILE}. ` +
+        `Use 'axon list' to see available commands.`,
       );
-      Deno.exit(1);
     }
 
     TARGET_COMMAND = cmdConfig.command;
@@ -426,36 +725,21 @@ async function main() {
     if (options.server) {
       const server = parsedData.servers.find((s) => s.name === options.server);
       if (!server) {
-        console.error(
-          colors.red(
-            `Error: Server '${options.server}' not found in configuration.`,
-          ),
-        );
-        Deno.exit(1);
+        fatal(`Error: Server '${options.server}' not found in configuration.`);
       }
 
       const hasValidTag = server.tags.some((tag) =>
         cmdConfig.tags.includes(tag)
       );
       if (!hasValidTag) {
-        console.error(
-          colors.red(
-            `Error: Command '${requestedCommandName}' is not valid for server '${server.name}'.`,
-          ),
-        );
-        Deno.exit(1);
+        fatal(`Error: Command '${requestedCommandName}' is not valid for server '${server.name}'.`);
       }
 
       TARGET_SCOPE = `Server: ${server.name}`;
       targetServers = [server];
     } else if (options.tag) {
       if (!cmdConfig.tags.includes(options.tag)) {
-        console.error(
-          colors.red(
-            `Error: The command '${requestedCommandName}' is not valid for tag '${options.tag}'.`,
-          ),
-        );
-        Deno.exit(1);
+        fatal(`Error: The command '${requestedCommandName}' is not valid for tag '${options.tag}'.`);
       }
 
       TARGET_SCOPE = `Tag: ${options.tag}`;
@@ -489,47 +773,25 @@ async function main() {
 
     const serverStatuses: ServerStatus[] = activeServers.map((config) => ({
       config,
-      status: "Checking Keys...",
-      outputBuffer: ["Connection setup queue initialized."],
+      status: "Success" as const,
+      currentPhase: "Pinging" as const,
+      outputBuffer: ["Queued for execution."],
     }));
 
-    // Pre-flight UI rendering
+    // Pre-flight: Only collect passwords for servers that need them (interactive mode only)
     if (!IS_UNATTENDED) {
       console.log(
         `${
           colors.bold.cyan(
-            `=== Step 1: Pre-Flight Assessment for ${TARGET_SCOPE} ===`,
+            `=== Step 1: Pre-Flight Password Collection for ${TARGET_SCOPE} ===`,
           )
         }`,
       );
-    } else {
-      await logToFile(
-        AXON_LOG,
-        `[Unattended Mode] Executing '${TARGET_COMMAND_NAME}' on ${TARGET_SCOPE}.`,
-      );
-    }
 
-    // Step 5: Security & Connection Pre-Flight
-    for (const server of serverStatuses) {
-      if (!IS_UNATTENDED) {
-        console.log(`Checking key configuration: ${server.config.name}...`);
-      }
-
-      const hasKey = await testSshKeyAuth(server.config);
-
-      if (!hasKey) {
-        if (IS_UNATTENDED) {
-          server.status = "Skipped";
-          server.outputBuffer.push("Skipped: Authentication required.");
-          await logToFile(
-            server.config.name,
-            `--- Skipped [${TARGET_COMMAND_NAME}] ---`,
-          );
-          await logToFile(
-            server.config.name,
-            `Reason: Node requires interactive password authentication.`,
-          );
-        } else {
+      for (const server of serverStatuses) {
+        // Quick check if SSH key exists
+        const hasKey = await testSshKeyAuth(server.config);
+        if (!hasKey) {
           console.log(
             `${
               colors.yellow(`⚠️  No SSH Key found for ${server.config.name}.`)
@@ -540,11 +802,13 @@ async function main() {
               `Enter password for ${server.config.user}@${server.config.ip}:`,
           });
           server.password = pwd;
-          server.status = "Password Cached";
         }
-      } else {
-        server.outputBuffer.push("SSH Key verified.");
       }
+    } else {
+      await logToFile(
+        AXON_LOG,
+        `[Unattended Mode] Executing '${TARGET_COMMAND_NAME}' on ${TARGET_SCOPE}.`,
+      );
     }
 
     const requiresSshpass = serverStatuses.some((server) =>
@@ -594,22 +858,57 @@ async function main() {
     }
 
     // Launch background tasks
-    const workers = serverStatuses.map((server) => executeSshTask(server));
+    const workers = serverStatuses.map((server) => executeServerTask(server));
     await Promise.all(workers);
 
-    // Step 7: Teardown & Finalization
+    // Step 7: Teardown, Summary & Finalization
+    const total = serverStatuses.length;
+    const successCount = serverStatuses.filter((s) => s.status === "Success").length;
+    const failedCount = serverStatuses.filter((s) => s.status === "Failed").length;
+    const offlineCount = serverStatuses.filter((s) => s.status === "Offline").length;
+    const skippedCount = serverStatuses.filter((s) => s.status === "Skipped").length;
+    const failures = total - successCount;
+
     if (!IS_UNATTENDED) {
       clearInterval(uiInterval);
       serverStatuses.forEach((server, index) => updateGridCell(server, index));
-      await new Promise((resolve) => setTimeout(resolve, 3000));
+      Terminal.write("\n\n" + colors.bold.cyan("Completed - Press any key to exit..."));
+
+      // Wait for a keypress
+      const buf = new Uint8Array(1);
+      await Deno.stdin.read(buf);
+
+      // await new Promise((resolve) => setTimeout(resolve, 1500));
 
       Terminal.leaveAltScreen();
       Terminal.showCursor();
+
+      console.log(colors.bold.cyan("\n=== Execution Summary ==="));
+      console.log(
+        colors.gray(
+          `Total: ${total}  Success: ${successCount}  Failed: ${failedCount}  Skipped: ${skippedCount}  Offline: ${offlineCount}`,
+        ),
+      );
+
+      if (failures > 0) {
+        console.log(colors.red('\nNon-success servers:'));
+        serverStatuses
+          .filter((s) => s.status !== "Success")
+          .forEach((s) => console.log(` - ${s.config.name}: ${s.status}`));
+      }
+
     } else {
-      serverStatuses.forEach((server, index) => {
-        logToFile( AXON_LOG, `  ${server.config.name}: ${server.status}`);
-      })
+      for (const server of serverStatuses) {
+        await logToFile(AXON_LOG, `  ${server.config.name}: ${server.status}`);
+      }
+      await logToFile(
+        AXON_LOG,
+        `Summary: total=${total} success=${successCount} failed=${failedCount} skipped=${skippedCount} offline=${offlineCount}`,
+      );
     }
+
+    // Exit with 0 when all succeeded; otherwise exit with number of failures
+    Deno.exit(failures);
 
   } catch (error: any) {
     if (!IS_UNATTENDED) {

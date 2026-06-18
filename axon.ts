@@ -2,8 +2,7 @@
 // axon
 /**
  * Axon: Multi-Node Parallel SSH Executor & Live Grid TUI Dashboard
- * Features tag-based routing, single-node targeting, file logging, and unattended modes.
- * Enforces strict SSH Key authentication.
+ * Features tag-based routing, strict SSH key auth, unattended execution, dry-run safety, and local command execution.
  */
 
 import { colors, Command, parseYaml } from "./deps.ts";
@@ -14,6 +13,7 @@ interface CommandConfig {
   check_command?: string;
   command: string;
   tags: string[];
+  type?: "remote" | "local"; // New: Determines execution context
 }
 
 interface ServerConfig {
@@ -44,6 +44,7 @@ function validateYamlConfig(data: unknown, source: string): asserts data is Yaml
     if (typeof cmd.command !== "string" || cmd.command.trim() === "") fatal(`Error: Command '${cmd.name}' must have a non-empty 'command'.`);
     if (cmd.check_command !== undefined && typeof cmd.check_command !== "string") fatal(`Error: Command '${cmd.name}' has invalid 'check_command'.`);
     if (!Array.isArray(cmd.tags) || cmd.tags.some((tag) => typeof tag !== "string")) fatal(`Error: Command '${cmd.name}' must have a 'tags' array.`);
+    if (cmd.type !== undefined && cmd.type !== "local" && cmd.type !== "remote") fatal(`Error: Command '${cmd.name}' type must be 'local' or 'remote'.`);
   });
 
   root.servers.forEach((server, index) => {
@@ -58,7 +59,6 @@ function validateYamlConfig(data: unknown, source: string): asserts data is Yaml
 }
 
 function listAvailableCommands(parsedData: YamlConfig, options: { server?: string; tag?: string; }): void {
-  // ... (Same as previous version)
   const byServer = options.server !== undefined;
   const byTag = options.tag !== undefined;
 
@@ -89,14 +89,14 @@ function listAvailableCommands(parsedData: YamlConfig, options: { server?: strin
 
   filteredCommands.forEach((cmd) => {
     const aliasText = cmd.aliases?.length ? ` (aliases: ${cmd.aliases.join(", ")})` : "";
-    console.log(colors.bold(cmd.name) + aliasText);
+    const typeText = cmd.type === "local" ? colors.magenta(" [LOCAL]") : "";
+    console.log(colors.bold(cmd.name) + aliasText + typeText);
     if (cmd.check_command) console.log(colors.gray(`  Idempotency Check: ${cmd.check_command}`));
     console.log(`  Tags: ${cmd.tags.join(", ")}\n`);
   });
 }
 
 function listAvailableServers(parsedData: YamlConfig, options: { server?: string; tag?: string; }): void {
-  // ... (Same as previous version)
   let filteredServers: ServerConfig[] = parsedData.servers;
   if (options.server) filteredServers = filteredServers.filter(s => s.name === options.server);
   if (options.tag) filteredServers = filteredServers.filter((server) => server.tags.includes(options.tag!));
@@ -118,13 +118,15 @@ interface ServerStatus {
 let TARGET_COMMAND = "";
 let TARGET_CHECK_COMMAND: string | undefined = undefined;
 let TARGET_COMMAND_NAME = "";
-let TARGET_SCOPE = "";
+let TARGET_COMMAND_TYPE: "remote" | "local" = "remote";
 let IS_UNATTENDED = false;
 let IS_VERBOSE = false;
+let IS_DRY_RUN = false;
 
 const USER = Deno.env.get("USER") || "default";
 const HOME = Deno.env.get("HOME") || "/root";
 const LOG_DIR = `/tmp/${USER}/axon`;
+const DOWNLOADS_DIR = `${LOG_DIR}/downloads`;
 const AXON_LOG = "axon.log";
 
 function fatal(message: string): never {
@@ -132,11 +134,22 @@ function fatal(message: string): never {
   Deno.exit(1);
 }
 
-try { Deno.mkdirSync(LOG_DIR, { recursive: true }); } catch (_e) {}
+try { Deno.mkdirSync(DOWNLOADS_DIR, { recursive: true }); } catch (_e) {}
 
 async function logToFile(serverName: string, message: string): Promise<void> {
   const logPath = `${LOG_DIR}/${serverName.replace(/[^a-zA-Z0-9_-]/g, "_")}.log`;
   try { await Deno.writeTextFile(logPath, `[${new Date().toISOString()}] ${message}\n`, { append: true }); } catch (_e) {}
+}
+
+// Template Engine
+function renderTemplate(template: string, server: ServerConfig): string {
+  const HOME = Deno.env.get("HOME") || "/Users/kevinmu"; // Fallback provided
+  return template
+    .replace(/\{\{home\}\}/g, HOME) // Add this line
+    .replace(/\{\{ip\}\}/g, server.ip)
+    .replace(/\{\{user\}\}/g, server.user)
+    .replace(/\{\{server_name\}\}/g, server.name)
+    .replace(/\{\{downloads\}\}/g, DOWNLOADS_DIR);
 }
 
 const LAYOUT = {
@@ -183,8 +196,16 @@ function drawStaticLayout(servers: ServerStatus[]): void {
   const rows = Math.ceil(servers.length / cols);
   const innerW = LAYOUT.boxWidth - 2;
 
+  let titleLine = IS_DRY_RUN ? colors.bgYellow.black(`  *** DRY RUN MODE ACTIVE *** `) : "";
+  if (titleLine) {
+    Terminal.moveTo(1, 1);
+    Terminal.write(titleLine);
+  }
+
+  const yOffset = IS_DRY_RUN ? 1 : 0;
+
   for (let r = 0; r < rows; r++) {
-    const topY = LAYOUT.startY(r);
+    const topY = LAYOUT.startY(r) + yOffset;
     let topLine = "";
     for (let c = 0; c < cols; c++) topLine += (c === 0 ? "╔" : "╦") + "═".repeat(innerW);
     Terminal.moveTo(1, topY); Terminal.write(topLine + "╗");
@@ -203,11 +224,12 @@ function drawStaticLayout(servers: ServerStatus[]): void {
 
 function updateGridCell(server: ServerStatus, index: number): void {
   const col = index % LAYOUT.cols, row = Math.floor(index / LAYOUT.cols);
-  const startX = LAYOUT.startX(col) + 1, startY = LAYOUT.startY(row) + 1;
+  const yOffset = IS_DRY_RUN ? 1 : 0;
+  const startX = LAYOUT.startX(col) + 1, startY = LAYOUT.startY(row) + 1 + yOffset;
   const innerW = LAYOUT.boxWidth - 2;
 
   const colorMap = { "Success": colors.green, "Failed": colors.red, "Skipped": colors.gray, "Offline": colors.red };
-  const phaseText = server.status in colorMap ? server.status : server.currentPhase;
+  const phaseText = server.status in colorMap && server.status !== "Success" ? server.status : server.currentPhase;
   const statusColor = colorMap[server.status as keyof typeof colorMap] || colors.yellow;
   
   let header = `${colors.bold(server.config.name)} (${server.config.ip}) ${statusColor(phaseText)}`;
@@ -237,40 +259,59 @@ async function executeServerTask(server: ServerStatus): Promise<void> {
     return;
   }
 
-  // Common SSH Args enforcing keys via BatchMode
   const sshArgs = [
-    "-o", "BatchMode=yes", // Forces SSH to fail if a password/prompt is required
+    "-o", "BatchMode=yes",
     "-o", "StrictHostKeyChecking=accept-new",
     "-o", "ConnectTimeout=10",
     `${server.config.user}@${server.config.ip}`
   ];
 
-  // Phase 2: Explicit Auth Check
-  server.currentPhase = "Checking SSH";
-  const authCmd = new Deno.Command("ssh", { args: [...sshArgs, "exit"], stdout: "null", stderr: "null" });
-  const authRes = await authCmd.output();
-  
-  if (!authRes.success) {
-    server.status = "Failed";
-    server.outputBuffer.push("Authentication failed. Missing or invalid SSH keys.");
-    await logToFile(server.config.name, `Reason: SSH key auth failed.`);
-    return;
+  // Phase 2: Explicit Auth Check (Skip if executing locally)
+  if (TARGET_COMMAND_TYPE !== "local") {
+    server.currentPhase = "Checking SSH";
+    const authCmd = new Deno.Command("ssh", { args: [...sshArgs, "exit"], stdout: "null", stderr: "null" });
+    if (!(await authCmd.output()).success) {
+      server.status = "Failed";
+      server.outputBuffer.push("Auth failed. Missing/invalid SSH keys.");
+      return;
+    }
   }
 
   // Phase 3: Idempotency Check
   if (TARGET_CHECK_COMMAND) {
     server.currentPhase = "Checking State";
-    const checkCmd = new Deno.Command("ssh", { args: [...sshArgs, TARGET_CHECK_COMMAND], stdout: "null", stderr: "null" });
+    const renderedCheck = renderTemplate(TARGET_CHECK_COMMAND, server.config);
+    
+    const checkCmd = TARGET_COMMAND_TYPE === "local" 
+      ? new Deno.Command("sh", { args: ["-c", renderedCheck], stdout: "null", stderr: "null" })
+      : new Deno.Command("ssh", { args: [...sshArgs, renderedCheck], stdout: "null", stderr: "null" });
+
     if ((await checkCmd.output()).success) {
       server.status = "Success";
-      server.outputBuffer.push("Desired state already met. Task skipped.");
+      server.currentPhase = "Success";
+      server.outputBuffer.push("State already met. Skipped.");
       return;
     }
   }
 
+  const renderedCommand = renderTemplate(TARGET_COMMAND, server.config);
+
+  // DRY RUN INTERCEPT
+  if (IS_DRY_RUN) {
+    server.status = "Success";
+    server.currentPhase = "Success";
+    server.outputBuffer.push(`[DRY RUN] Would execute:`);
+    server.outputBuffer.push(renderedCommand);
+    await logToFile(server.config.name, `[DRY RUN] Skipped execution of: ${renderedCommand}`);
+    return;
+  }
+
   // Phase 4: Execute Main Command
   server.currentPhase = "Running";
-  const command = new Deno.Command("ssh", { args: [...sshArgs, TARGET_COMMAND], stdout: "piped", stderr: "piped" });
+  const command = TARGET_COMMAND_TYPE === "local"
+    ? new Deno.Command("sh", { args: ["-c", renderedCommand], stdout: "piped", stderr: "piped" })
+    : new Deno.Command("ssh", { args: [...sshArgs, renderedCommand], stdout: "piped", stderr: "piped" });
+
   const child = command.spawn();
 
   const readStream = async (stream: ReadableStream<Uint8Array>, isErr: boolean) => {
@@ -294,7 +335,9 @@ async function executeServerTask(server: ServerStatus): Promise<void> {
   };
 
   await Promise.all([readStream(child.stdout, false), readStream(child.stderr, true)]);
-  server.status = (await child.status).success ? "Success" : "Failed";
+  const success = (await child.status).success;
+  server.status = success ? "Success" : "Failed";
+  server.currentPhase = success ? "Success" : "Failed";
 }
 
 async function main() {
@@ -308,6 +351,7 @@ async function main() {
       .option("-s, --server <server:string>", "Target by server name")
       .option("-u, --unattended", "Run silently without TUI")
       .option("-v, --verbose", "Enable verbose logging")
+      .option("-d, --dry-run", "Simulate execution without modifying the remote servers")
       .parse(Deno.args);
 
     if (options.tag && options.server && !["commands", "servers"].includes(args[0])) {
@@ -316,6 +360,7 @@ async function main() {
 
     IS_UNATTENDED = !!options.unattended;
     IS_VERBOSE = !!options.verbose;
+    IS_DRY_RUN = !!options.dryRun;
     TARGET_COMMAND_NAME = args[0];
 
     const rawYaml = await Deno.readTextFile(options.config).catch(() => fatal(`Error: Could not read ${options.config}`));
@@ -330,6 +375,7 @@ async function main() {
 
     TARGET_COMMAND = cmdConfig.command;
     TARGET_CHECK_COMMAND = cmdConfig.check_command;
+    TARGET_COMMAND_TYPE = cmdConfig.type || "remote"; // Defaults to remote if not specified
 
     let targetServers = parsedData.servers.filter(s => s.active);
     if (options.server) {
@@ -361,7 +407,6 @@ async function main() {
       await logToFile(AXON_LOG, `[Unattended Mode] Executing '${TARGET_COMMAND_NAME}'`);
     }
 
-    // Concurrency Batching
     for (let i = 0; i < serverStatuses.length; i += 10) {
       await Promise.all(serverStatuses.slice(i, i + 10).map(executeServerTask));
     }
@@ -381,6 +426,7 @@ async function main() {
       Terminal.showCursor();
 
       console.log(colors.bold.cyan("\n=== Execution Summary ==="));
+      if (IS_DRY_RUN) console.log(colors.yellow("Note: This was a DRY RUN. No commands were actually executed."));
       if (failures > 0) {
         console.log(colors.red('Non-success servers:'));
         serverStatuses.filter(s => s.status !== "Success").forEach(s => console.log(` - ${s.config.name}: ${s.status}`));

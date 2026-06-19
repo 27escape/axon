@@ -14,7 +14,7 @@ interface CommandConfig {
   command: string;
   post_command?: string;
   tags: string[];
-  type?: "remote" | "local"; // New: Determines execution context
+  type?: "remote" | "local";
 }
 
 interface ServerConfig {
@@ -28,6 +28,13 @@ interface ServerConfig {
 interface YamlConfig {
   commands: CommandConfig[];
   servers: ServerConfig[];
+}
+
+interface ServerStatus {
+  config: ServerConfig;
+  status: "Success" | "Failed" | "Skipped" | "Offline";
+  currentPhase: "Queued" | "Pinging" | "Checking SSH" | "Checking State" | "Running" | "Success" | "Failed";
+  outputBuffer: string[];
 }
 
 function validateYamlConfig(data: unknown, source: string): asserts data is YamlConfig {
@@ -66,7 +73,6 @@ function listAvailableCommands(parsedData: YamlConfig, options: { server?: strin
 
   let validServer: ServerConfig | undefined;
   let filteredCommands: CommandConfig[] = parsedData.commands;
-  let serverNamesForTag: string[] = [];
 
   if (byServer) {
     validServer = parsedData.servers.find((s) => s.name === options.server);
@@ -78,7 +84,6 @@ function listAvailableCommands(parsedData: YamlConfig, options: { server?: strin
     filteredCommands = parsedData.commands.filter((cmd) =>
       cmd.tags.includes(options.tag!) && (!byServer || cmd.tags.some((tag) => validServer!.tags.includes(tag)))
     );
-    serverNamesForTag = parsedData.servers.filter((server) => server.tags.includes(options.tag!)).map((server) => server.name);
   }
 
   const title = byServer ? `Valid commands for server '${validServer!.name}'` : byTag ? `Valid commands for tag '${options.tag}'` : "Available commands";
@@ -110,13 +115,6 @@ function listAvailableServers(parsedData: YamlConfig, options: { server?: string
   });
 }
 
-interface ServerStatus {
-  config: ServerConfig;
-  status: "Success" | "Failed" | "Skipped" | "Offline";
-  currentPhase: "Queued" | "Pinging" | "Checking SSH" | "Checking State" | "Running" | "Success" | "Failed";
-  outputBuffer: string[];
-}
-
 let TARGET_COMMAND = "";
 let TARGET_CHECK_COMMAND: string | undefined = undefined;
 let TARGET_POST_COMMAND: string | undefined = undefined;
@@ -125,6 +123,7 @@ let TARGET_COMMAND_TYPE: "remote" | "local" = "remote";
 let IS_UNATTENDED = false;
 let IS_VERBOSE = false;
 let IS_DRY_RUN = false;
+let IS_FORCED = false;
 
 const USER = Deno.env.get("USER") || "default";
 const HOME = Deno.env.get("HOME") || "/root";
@@ -144,9 +143,7 @@ async function logToFile(serverName: string, message: string): Promise<void> {
   try { await Deno.writeTextFile(logPath, `[${new Date().toISOString()}] ${message}\n`, { append: true }); } catch (_e) {}
 }
 
-// Template Engine
 function renderTemplate(template: string, server: ServerConfig, status?: string): string {
-  // Utilising the global HOME variable to prevent environmental fragmentation
   return template
     .replace(/\{\{home\}\}/g, HOME)
     .replace(/\{\{ip\}\}/g, server.ip)
@@ -166,11 +163,18 @@ const LAYOUT = {
 function calculateLayout(serverCount: number): void {
   try {
     const { columns, rows } = Deno.consoleSize();
-    LAYOUT.cols = serverCount <= 4 ? 2 : Math.ceil(Math.sqrt(serverCount));
-    const gridRows = Math.ceil(serverCount / LAYOUT.cols);
-    LAYOUT.boxWidth = Math.max(40, Math.floor((columns - 2 + (LAYOUT.cols - 1)) / LAYOUT.cols));
-    LAYOUT.boxHeight = Math.max(7, Math.floor((rows + (gridRows - 1)) / gridRows));
-    LAYOUT.logRows = Math.max(0, LAYOUT.boxHeight - 4);
+    if (serverCount === 1) {
+      LAYOUT.cols = 1;
+      LAYOUT.boxWidth = columns;
+      LAYOUT.boxHeight = rows;
+      LAYOUT.logRows = rows - 4;
+    } else {
+      LAYOUT.cols = Math.ceil(Math.sqrt(serverCount));
+      const gridRows = Math.ceil(serverCount / LAYOUT.cols);
+      LAYOUT.boxWidth = Math.max(40, Math.floor((columns - 2 + (LAYOUT.cols - 1)) / LAYOUT.cols));
+      LAYOUT.boxHeight = Math.max(7, Math.floor((rows + (gridRows - 1)) / gridRows));
+      LAYOUT.logRows = Math.max(0, LAYOUT.boxHeight - 4);
+    }
   } catch (_e) {}
 }
 
@@ -202,12 +206,14 @@ function drawStaticLayout(servers: ServerStatus[]): void {
   const innerW = LAYOUT.boxWidth - 2;
 
   let titleLine = IS_DRY_RUN ? colors.bgYellow.black(`  *** DRY RUN MODE ACTIVE *** `) : "";
+  if (IS_FORCED) titleLine += colors.bgRed.white(`  *** FORCE MODE ACTIVE *** `);
+  
   if (titleLine) {
     Terminal.moveTo(1, 1);
     Terminal.write(titleLine);
   }
 
-  const yOffset = IS_DRY_RUN ? 1 : 0;
+  const yOffset = (IS_DRY_RUN || IS_FORCED) ? 1 : 0;
 
   for (let r = 0; r < rows; r++) {
     const topY = LAYOUT.startY(r) + yOffset;
@@ -229,7 +235,7 @@ function drawStaticLayout(servers: ServerStatus[]): void {
 
 function updateGridCell(server: ServerStatus, index: number): void {
   const col = index % LAYOUT.cols, row = Math.floor(index / LAYOUT.cols);
-  const yOffset = IS_DRY_RUN ? 1 : 0;
+  const yOffset = (IS_DRY_RUN || IS_FORCED) ? 1 : 0;
   const startX = LAYOUT.startX(col) + 1, startY = LAYOUT.startY(row) + 1 + yOffset;
   const innerW = LAYOUT.boxWidth - 2;
 
@@ -254,7 +260,6 @@ function updateGridCell(server: ServerStatus, index: number): void {
 async function executeServerTask(server: ServerStatus): Promise<void> {
   if (server.status === "Skipped" || server.status === "Offline") return;
 
-  // Phase 1: Ping
   server.currentPhase = "Pinging";
   await logToFile(server.config.name, `--- Starting Task [${TARGET_COMMAND_NAME}] ---`);
 
@@ -271,7 +276,6 @@ async function executeServerTask(server: ServerStatus): Promise<void> {
     `${server.config.user}@${server.config.ip}`
   ];
 
-  // Phase 2: Explicit Auth Check (Skip if executing locally)
   if (TARGET_COMMAND_TYPE !== "local") {
     server.currentPhase = "Checking SSH";
     const authCmd = new Deno.Command("ssh", { args: [...sshArgs, "exit"], stdout: "null", stderr: "null" });
@@ -282,8 +286,8 @@ async function executeServerTask(server: ServerStatus): Promise<void> {
     }
   }
 
-  // Phase 3: Idempotency Check
-  if (TARGET_CHECK_COMMAND) {
+  // Idempotency check logic with FORCE override
+  if (TARGET_CHECK_COMMAND && !IS_FORCED) {
     server.currentPhase = "Checking State";
     const renderedCheck = renderTemplate(TARGET_CHECK_COMMAND, server.config);
     
@@ -301,7 +305,6 @@ async function executeServerTask(server: ServerStatus): Promise<void> {
 
   const renderedCommand = renderTemplate(TARGET_COMMAND, server.config);
 
-  // DRY RUN INTERCEPT
   if (IS_DRY_RUN) {
     server.status = "Success";
     server.currentPhase = "Success";
@@ -311,7 +314,6 @@ async function executeServerTask(server: ServerStatus): Promise<void> {
     return;
   }
 
-  // Phase 4: Execute Main Command
   server.currentPhase = "Running";
   const command = TARGET_COMMAND_TYPE === "local"
     ? new Deno.Command("sh", { args: ["-c", renderedCommand], stdout: "piped", stderr: "piped" })
@@ -344,7 +346,6 @@ async function executeServerTask(server: ServerStatus): Promise<void> {
   server.status = success ? "Success" : "Failed";
   server.currentPhase = success ? "Success" : "Failed";
 
-  // Post-command: runs locally on success only, never in dry-run (already intercepted above)
   if (success && TARGET_POST_COMMAND) {
     const renderedPost = renderTemplate(TARGET_POST_COMMAND, server.config, success ? "PASSED" : "FAILED");
     try {
@@ -382,6 +383,8 @@ async function main() {
       .option("-u, --unattended", "Run silently without TUI")
       .option("-v, --verbose", "Enable verbose logging")
       .option("-d, --dry-run", "Simulate execution without modifying the remote servers")
+      .option("-f, --force", "Ignore idempotency check")
+      .option("--no-check", "Alias for --force")
       .parse(Deno.args);
 
     if (options.tag && options.server && !["commands", "servers"].includes(args[0])) {
@@ -391,6 +394,7 @@ async function main() {
     IS_UNATTENDED = !!options.unattended;
     IS_VERBOSE = !!options.verbose;
     IS_DRY_RUN = !!options.dryRun;
+    IS_FORCED = !!(options.force || options.noCheck);
     TARGET_COMMAND_NAME = args[0];
 
     const rawYaml = await Deno.readTextFile(options.config).catch(() => fatal(`Error: Could not read ${options.config}`));
@@ -406,7 +410,7 @@ async function main() {
     TARGET_COMMAND = cmdConfig.command;
     TARGET_CHECK_COMMAND = cmdConfig.check_command;
     TARGET_POST_COMMAND = cmdConfig.post_command;
-    TARGET_COMMAND_TYPE = cmdConfig.type || "remote"; // Defaults to remote if not specified
+    TARGET_COMMAND_TYPE = cmdConfig.type || "remote";
 
     let targetServers = parsedData.servers.filter(s => s.active);
     if (options.server) {
@@ -450,13 +454,11 @@ async function main() {
       
       Terminal.write("\n\n" + colors.bold.cyan("Completed - Press any key to exit..."));
       
-      // Structural Integrity Guard: Check if running in a TTY environment before setting raw mode
       if (Deno.stdin.isTerminal()) {
         try { Deno.stdin.setRaw(true); } catch {}
         await Deno.stdin.read(new Uint8Array(1));
         try { Deno.stdin.setRaw(false); } catch {}
       } else {
-        // Fallback for non-interactive environments
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
 
@@ -465,6 +467,7 @@ async function main() {
 
       console.log(colors.bold.cyan("\n=== Execution Summary ==="));
       if (IS_DRY_RUN) console.log(colors.yellow("Note: This was a DRY RUN. No commands were actually executed."));
+      if (IS_FORCED) console.log(colors.red("Note: FORCE mode was active. Idempotency checks were bypassed."));
       if (failures > 0) {
         console.log(colors.red('Non-success servers:'));
         serverStatuses.filter(s => s.status !== "Success").forEach(s => console.log(` - ${s.config.name}: ${s.status}`));

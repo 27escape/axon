@@ -41,7 +41,7 @@
       "command": "echo cleaning && rm -rf dist"
     },
 
-    "compile:axon": "deno_compile.sh --flags='-RWESI' -r axon.ts",
+    "compile:axon": "deno_compile --flags='-RWESI' -r axon.ts",
     "compile:all": {
       "description": "build for the current platform target",
       "command": "echo compile everything",

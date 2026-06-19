@@ -46,7 +46,7 @@ The config file (see below) needs to be copied to your home directory
 cp ~/.axon_config.yml $HOME/.axon_config.yml
 ```
 
-Modify this file to your setup 
+Modify this file to your setup
 
 ### Configuration (axon_config.yml)
 
@@ -59,17 +59,33 @@ commands:
     aliases: [ "upgrade"]
     check_command: 'check_command: test $(apt list --upgradable 2>/dev/null | wc -l) -le 1'
     command: 'sudo sh -c "apt update && apt upgrade -y && apt autoremove -y"'
-    tags: ["linux", "pi"]
-  - name: "ping"
+    post_command: 'mqtxt /axon/status {{name}} {{server_name}} {{status}}'
+
+- name: "ping"
     command: 'echo "pong"'
     tags: ["linux", "pi", "mac"]
-  - name: "brew-update"
+
+- name: "brew-update"
     command: 'brew upgrade'
     tags: ["mac"]
+
   - name: install-nginx
     check_command: dpkg -l | grep -q nginx
     command: sudo apt-get install -y nginx
     tags: [webservers]
+
+  - name: push-gnarlypi
+    type: local
+    command: '{{home}}/Repos/personal/python/gnarlypi/sync.sh {{ip}}'
+    tags:
+      - gnarlypi
+
+  - name: pull-syslogs
+    type: local
+    command: 'scp {{user}}@{{ip}}:/var/log/syslog {{downloads}}/{{server_name}}_syslog.log'
+    tags:
+      - pi
+
 
 servers:
   - name: "photos.local"
@@ -84,7 +100,21 @@ servers:
     tags: ["mac"]
 ```
 
-Note that it is possible to check if a command needs to be run, this is useful if the command may take a long time. This is the purpose of the `check_command` entry, if it returns true (0) then the command would not be actioned, otherwise it will be. For simple commands such as `ping` we do not need, or want, to use this pre-check.
+Note that it is possible to check if a command needs to be run, this is useful if the command may take a long time. This is the purpose of the `check_command` entry, if it returns true (0) then the command would not be actioned, otherwise it will be. For simple commands such as `ping` we do not need, or want, to use this pre-check but for system upgrades, we might.
+
+To the command entries we can add a `type` field, if this is set to be 'local' then this allows the running of a command on the local system, for example to copy files or fetch then. Any other value will trigger a failure.
+
+We have implemented some templates to support this and other features
+
+- {{home}} - your home directory
+- {{user}} - your login name
+- {{downloads}} - local folder where fetched files can be stored, normally in `/tmp/$USER/axon/downloads`
+- {{server_name}} - the name of the remote server from the config
+- {{ip}} - the ip address of the remote server from the config
+- {{command}} - the command that is to be run
+- {{name}} - the name of the entry
+- {{status}} - the status of the command that was run, will be PASSED or FAILED
+
 
 ## Usage
 

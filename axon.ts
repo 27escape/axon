@@ -12,6 +12,7 @@ interface CommandConfig {
   aliases?: string[];
   check_command?: string;
   command: string;
+  post_command?: string;
   tags: string[];
   type?: "remote" | "local"; // New: Determines execution context
 }
@@ -43,6 +44,7 @@ function validateYamlConfig(data: unknown, source: string): asserts data is Yaml
     if (typeof cmd.name !== "string" || cmd.name.trim() === "") fatal(`Error: Command entry at index ${index} must have a non-empty 'name'.`);
     if (typeof cmd.command !== "string" || cmd.command.trim() === "") fatal(`Error: Command '${cmd.name}' must have a non-empty 'command'.`);
     if (cmd.check_command !== undefined && typeof cmd.check_command !== "string") fatal(`Error: Command '${cmd.name}' has invalid 'check_command'.`);
+    if (cmd.post_command !== undefined && typeof cmd.post_command !== "string") fatal(`Error: Command '${cmd.name}' has invalid 'post_command'.`);
     if (!Array.isArray(cmd.tags) || cmd.tags.some((tag) => typeof tag !== "string")) fatal(`Error: Command '${cmd.name}' must have a 'tags' array.`);
     if (cmd.type !== undefined && cmd.type !== "local" && cmd.type !== "remote") fatal(`Error: Command '${cmd.name}' type must be 'local' or 'remote'.`);
   });
@@ -111,12 +113,13 @@ function listAvailableServers(parsedData: YamlConfig, options: { server?: string
 interface ServerStatus {
   config: ServerConfig;
   status: "Success" | "Failed" | "Skipped" | "Offline";
-  currentPhase: "Queued" | "Pinging" | "Checking SSH" | "Checking State" | "Running";
+  currentPhase: "Queued" | "Pinging" | "Checking SSH" | "Checking State" | "Running" | "Success" | "Failed";
   outputBuffer: string[];
 }
 
 let TARGET_COMMAND = "";
 let TARGET_CHECK_COMMAND: string | undefined = undefined;
+let TARGET_POST_COMMAND: string | undefined = undefined;
 let TARGET_COMMAND_NAME = "";
 let TARGET_COMMAND_TYPE: "remote" | "local" = "remote";
 let IS_UNATTENDED = false;
@@ -142,14 +145,16 @@ async function logToFile(serverName: string, message: string): Promise<void> {
 }
 
 // Template Engine
-function renderTemplate(template: string, server: ServerConfig): string {
-  const HOME = Deno.env.get("HOME") || "/Users/kevinmu"; // Fallback provided
+function renderTemplate(template: string, server: ServerConfig, status?: string): string {
+  // Utilising the global HOME variable to prevent environmental fragmentation
   return template
-    .replace(/\{\{home\}\}/g, HOME) // Add this line
+    .replace(/\{\{home\}\}/g, HOME)
     .replace(/\{\{ip\}\}/g, server.ip)
     .replace(/\{\{user\}\}/g, server.user)
     .replace(/\{\{server_name\}\}/g, server.name)
-    .replace(/\{\{downloads\}\}/g, DOWNLOADS_DIR);
+    .replace(/\{\{downloads\}\}/g, DOWNLOADS_DIR)
+    .replace(/\{\{name\}\}/g, TARGET_COMMAND_NAME)
+    .replace(/\{\{status\}\}/g, status ?? "");
 }
 
 const LAYOUT = {
@@ -338,6 +343,31 @@ async function executeServerTask(server: ServerStatus): Promise<void> {
   const success = (await child.status).success;
   server.status = success ? "Success" : "Failed";
   server.currentPhase = success ? "Success" : "Failed";
+
+  // Post-command: runs locally on success only, never in dry-run (already intercepted above)
+  if (success && TARGET_POST_COMMAND) {
+    const renderedPost = renderTemplate(TARGET_POST_COMMAND, server.config, success ? "PASSED" : "FAILED");
+    try {
+      const postCmd = new Deno.Command("sh", { args: ["-c", renderedPost], stdout: "null", stderr: "piped" });
+      const postResult = await postCmd.output();
+      if (!postResult.success) {
+        const errText = new TextDecoder().decode(postResult.stderr).trim();
+        const failMsg = `[POST_COMMAND FAILED] ${errText || renderedPost}`;
+        if (IS_UNATTENDED) {
+          await logToFile(server.config.name, failMsg);
+        } else {
+          server.outputBuffer.push(`\x1b[7m\x1b[37m\x1b[41m${failMsg}\x1b[0m`);
+        }
+      }
+    } catch (e: any) {
+      const failMsg = `[POST_COMMAND ERROR] ${e.message}`;
+      if (IS_UNATTENDED) {
+        await logToFile(server.config.name, failMsg);
+      } else {
+        server.outputBuffer.push(`\x1b[7m\x1b[37m\x1b[41m${failMsg}\x1b[0m`);
+      }
+    }
+  }
 }
 
 async function main() {
@@ -375,6 +405,7 @@ async function main() {
 
     TARGET_COMMAND = cmdConfig.command;
     TARGET_CHECK_COMMAND = cmdConfig.check_command;
+    TARGET_POST_COMMAND = cmdConfig.post_command;
     TARGET_COMMAND_TYPE = cmdConfig.type || "remote"; // Defaults to remote if not specified
 
     let targetServers = parsedData.servers.filter(s => s.active);
@@ -418,9 +449,16 @@ async function main() {
       serverStatuses.forEach((s, i) => updateGridCell(s, i));
       
       Terminal.write("\n\n" + colors.bold.cyan("Completed - Press any key to exit..."));
-      try { Deno.stdin.setRaw(true); } catch {}
-      await Deno.stdin.read(new Uint8Array(1));
-      try { Deno.stdin.setRaw(false); } catch {}
+      
+      // Structural Integrity Guard: Check if running in a TTY environment before setting raw mode
+      if (Deno.stdin.isTerminal()) {
+        try { Deno.stdin.setRaw(true); } catch {}
+        await Deno.stdin.read(new Uint8Array(1));
+        try { Deno.stdin.setRaw(false); } catch {}
+      } else {
+        // Fallback for non-interactive environments
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
 
       Terminal.leaveAltScreen();
       Terminal.showCursor();

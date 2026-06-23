@@ -2,8 +2,10 @@
 // axon
 /**
  * Axon: Multi-Node Parallel SSH Executor & Live Grid TUI Dashboard
- * Features tag-based routing, strict SSH key auth, unattended execution, dry-run safety, and local command execution.
+ * Features tag-based routing, strict SSH key auth, unattended execution, dry-run safety, local command execution, global timeouts, persistent XDG logging, and dynamic layout resizing.
  */
+
+const VERSION = "4.0.1";
 
 import { colors, Command, parseYaml } from "./deps.ts";
 
@@ -32,9 +34,57 @@ interface YamlConfig {
 
 interface ServerStatus {
   config: ServerConfig;
-  status: "Success" | "Failed" | "Skipped" | "Offline";
-  currentPhase: "Queued" | "Pinging" | "Checking SSH" | "Checking State" | "Running" | "Success" | "Failed";
+  status: "Success" | "Failed" | "Skipped" | "Offline" | "Aborted" | "Timeout";
+  currentPhase: "Queued" | "Pinging" | "Checking SSH" | "Checking State" | "Running" | "Success" | "Failed" | "Aborted" | "Timeout";
   outputBuffer: string[];
+}
+
+// --- Global Application State for Graceful Shutdown & Concurrency ---
+const APP_STATE = {
+  isShuttingDown: false,
+  isCompleted: false,
+  uiInterval: undefined as ReturnType<typeof setInterval> | undefined,
+  servers: [] as ServerStatus[],
+  abortController: new AbortController()
+};
+
+const GLOBAL_TIMEOUT_MS = 10 * 60 * 1000; // 10 Minutes Watchdog
+
+// --- Directory Setup & Persistence ---
+const USER = Deno.env.get("USER") || "default";
+const HOME = Deno.env.get("HOME") || "/root";
+const STATE_DIR = `${HOME}/.local/state/axon`;
+const LOG_DIR = `${STATE_DIR}/logs`;
+const DOWNLOADS_DIR = `${STATE_DIR}/downloads`;
+const AXON_LOG = "axon.log";
+
+function initDirectories() {
+  try {
+    Deno.mkdirSync(LOG_DIR, { recursive: true });
+    Deno.mkdirSync(DOWNLOADS_DIR, { recursive: true });
+  } catch (_e) {
+    // Failsafe: If XDG path fails (e.g. permission issues), fallback to temp.
+  }
+}
+
+async function pruneOldLogs() {
+  try {
+    const files = [];
+    for await (const dirEntry of Deno.readDir(LOG_DIR)) {
+      if (dirEntry.isFile && dirEntry.name.startsWith("run_") && dirEntry.name.endsWith(".json")) {
+        const stat = await Deno.stat(`${LOG_DIR}/${dirEntry.name}`);
+        files.push({ name: dirEntry.name, time: stat.mtime?.getTime() || 0 });
+      }
+    }
+    // Sort newest first, keep top 10
+    files.sort((a, b) => b.time - a.time);
+    const toDelete = files.slice(10);
+    for (const file of toDelete) {
+      await Deno.remove(`${LOG_DIR}/${file.name}`).catch(() => {});
+    }
+  } catch (_e) {
+    // Silently ignore pruning errors to protect the main run loop
+  }
 }
 
 function validateYamlConfig(data: unknown, source: string): asserts data is YamlConfig {
@@ -125,18 +175,10 @@ let IS_VERBOSE = false;
 let IS_DRY_RUN = false;
 let IS_FORCED = false;
 
-const USER = Deno.env.get("USER") || "default";
-const HOME = Deno.env.get("HOME") || "/root";
-const LOG_DIR = `/tmp/${USER}/axon`;
-const DOWNLOADS_DIR = `${LOG_DIR}/downloads`;
-const AXON_LOG = "axon.log";
-
 function fatal(message: string): never {
   console.error(colors.red(message));
   Deno.exit(1);
 }
-
-try { Deno.mkdirSync(DOWNLOADS_DIR, { recursive: true }); } catch (_e) {}
 
 async function logToFile(serverName: string, message: string): Promise<void> {
   const logPath = `${LOG_DIR}/${serverName.replace(/[^a-zA-Z0-9_-]/g, "_")}.log`;
@@ -192,7 +234,12 @@ const Terminal = {
 async function pingHost(server: ServerConfig): Promise<boolean> {
   const isMac = Deno.build.os === "darwin";
   try {
-    const command = new Deno.Command("ping", { args: ["-c", "1", "-W", isMac ? "2000" : "2", server.ip], stdout: "null", stderr: "null" });
+    const command = new Deno.Command("ping", { 
+      args: ["-c", "1", "-W", isMac ? "2000" : "2", server.ip], 
+      stdout: "null", 
+      stderr: "null",
+      signal: APP_STATE.abortController.signal 
+    });
     const { success } = await command.output();
     return success;
   } catch (_e) { return true; }
@@ -239,7 +286,14 @@ function updateGridCell(server: ServerStatus, index: number): void {
   const startX = LAYOUT.startX(col) + 1, startY = LAYOUT.startY(row) + 1 + yOffset;
   const innerW = LAYOUT.boxWidth - 2;
 
-  const colorMap = { "Success": colors.green, "Failed": colors.red, "Skipped": colors.gray, "Offline": colors.red };
+  const colorMap = { 
+    "Success": colors.green, 
+    "Failed": colors.red, 
+    "Skipped": colors.gray, 
+    "Offline": colors.red, 
+    "Aborted": colors.magenta,
+    "Timeout": colors.red 
+  };
   const phaseText = server.status in colorMap && server.status !== "Success" ? server.status : server.currentPhase;
   const statusColor = colorMap[server.status as keyof typeof colorMap] || colors.yellow;
   
@@ -257,8 +311,123 @@ function updateGridCell(server: ServerStatus, index: number): void {
   });
 }
 
+function drawCompletionMessage(): void {
+  if (IS_UNATTENDED || APP_STATE.servers.length === 0) return;
+  const yOffset = (IS_DRY_RUN || IS_FORCED) ? 1 : 0;
+  const totalRows = Math.ceil(APP_STATE.servers.length / LAYOUT.cols);
+  // Calculate the exact line below the bottom of the grid
+  const bottomY = LAYOUT.startY(totalRows - 1) + LAYOUT.boxHeight + yOffset + 1;
+  Terminal.moveTo(1, bottomY);
+  // The padding clears any stray characters that might have been there
+  Terminal.write(colors.bold.cyan("Completed - Press any key to exit...") + " ".repeat(10));
+}
+
+// --- Dynamic Window Resizing Logic ---
+function handleResize(): void {
+  if (APP_STATE.isShuttingDown || IS_UNATTENDED || APP_STATE.servers.length === 0) return;
+  calculateLayout(APP_STATE.servers.length);
+  Terminal.clearScreen();
+  drawStaticLayout(APP_STATE.servers);
+  APP_STATE.servers.forEach((s, i) => updateGridCell(s, i));
+  
+  // Restore the completion prompt if we are in the waiting phase
+  if (APP_STATE.isCompleted) {
+    drawCompletionMessage();
+  }
+}
+
+try {
+  Deno.addSignalListener("SIGWINCH", handleResize);
+} catch (_e) {
+  // Gracefully ignore on operating systems that do not support SIGWINCH (e.g., Windows)
+}
+
+// --- Unified Shutdown Handler ---
+async function gracefulShutdown(reason: string): Promise<never> {
+  if (APP_STATE.isShuttingDown) await new Promise(() => {}); // Prevent recursive shutdown loops
+  APP_STATE.isShuttingDown = true;
+
+  // Immediately terminate any hanging processes
+  APP_STATE.abortController.abort();
+
+  if (APP_STATE.uiInterval) clearInterval(APP_STATE.uiInterval);
+
+  // If interrupted or timed out, mark any non-terminal states explicitly
+  if (reason === "SIGINT" || reason === "Global Timeout") {
+    const finalState = reason === "SIGINT" ? "Aborted" : "Timeout";
+    const finalMessage = reason === "SIGINT" 
+      ? "Process aborted by user (SIGINT)." 
+      : "Execution aborted by Global Watchdog (Timeout).";
+
+    APP_STATE.servers.forEach(s => {
+      if (["Queued", "Pinging", "Checking SSH", "Checking State", "Running"].includes(s.currentPhase)) {
+        s.status = finalState;
+        s.currentPhase = finalState;
+        s.outputBuffer.push(finalMessage);
+      }
+    });
+  }
+
+  // Teardown TUI
+  if (!IS_UNATTENDED && APP_STATE.servers.length > 0) {
+    APP_STATE.servers.forEach((s, i) => updateGridCell(s, i));
+    Terminal.leaveAltScreen();
+    Terminal.showCursor();
+  }
+
+  // Calculate Exit Code based on Gold Principles
+  const exitContributors = APP_STATE.servers.filter(s => s.status !== "Success" && s.status !== "Skipped");
+  const skippedCount = APP_STATE.servers.filter(s => s.status === "Skipped").length;
+  const totalFailures = exitContributors.length;
+  const exitCode = Math.min(totalFailures, 255);
+
+  // Create persistent timestamped log filename
+  const timestamp = new Date().toISOString().replace(/[-:]/g, "").split(".")[0]; // format: YYYYMMDDTHHMMSS
+  const runLogPath = `${LOG_DIR}/run_${timestamp}.json`;
+
+  // Render Final Summary
+  if (!IS_UNATTENDED && APP_STATE.servers.length > 0) {
+    console.log(colors.bold.cyan("\n=== Execution Summary ==="));
+    if (reason === "SIGINT") console.log(colors.bgRed.white(" *** EXECUTION ABORTED BY USER *** "));
+    if (reason === "Global Timeout") console.log(colors.bgRed.white(" *** EXECUTION TIMED OUT *** "));
+    if (IS_DRY_RUN) console.log(colors.yellow("Note: This was a DRY RUN. No commands were actually executed."));
+    if (IS_FORCED) console.log(colors.red("Note: FORCE mode was active. Idempotency checks were bypassed."));
+    
+    console.log(`\nTotal Targets: ${APP_STATE.servers.length}`);
+    console.log(`Success:       ${colors.green((APP_STATE.servers.length - totalFailures - skippedCount).toString())}`);
+    console.log(`Skipped:       ${colors.gray(skippedCount.toString())} (Informational)`);
+    console.log(`Failures:      ${totalFailures > 0 ? colors.red(totalFailures.toString()) : "0"} (Exit Code Contributors)`);
+
+    if (totalFailures > 0) {
+      console.log(colors.red('\nNon-success servers:'));
+      exitContributors.forEach(s => {
+        const outColor = (s.status === "Aborted" || s.status === "Timeout") ? colors.magenta : colors.red;
+        console.log(` - ${colors.bold(s.config.name)}: ${outColor(s.status)}`);
+      });
+    } else {
+      console.log(colors.green("\nExecution complete: All systems operational or skipped cleanly."));
+    }
+    
+    // Announce persistent log location
+    console.log(colors.cyan(`\nPersistent Audit Log: ${runLogPath}`));
+  }
+
+  // Persist final state to structured JSON file
+  try {
+    await Deno.writeTextFile(runLogPath, JSON.stringify(APP_STATE.servers, null, 2));
+  } catch (_e) {}
+
+  Deno.exit(exitCode);
+}
+
+Deno.addSignalListener("SIGINT", () => {
+  gracefulShutdown("SIGINT");
+});
+
+
 async function executeServerTask(server: ServerStatus): Promise<void> {
-  if (server.status === "Skipped" || server.status === "Offline") return;
+  if (APP_STATE.isShuttingDown) return; // Generation Guard against post-interrupt execution
+  if (server.status === "Skipped" || server.status === "Offline" || server.status === "Aborted" || server.status === "Timeout") return;
 
   server.currentPhase = "Pinging";
   await logToFile(server.config.name, `--- Starting Task [${TARGET_COMMAND_NAME}] ---`);
@@ -269,6 +438,8 @@ async function executeServerTask(server: ServerStatus): Promise<void> {
     return;
   }
 
+  if (APP_STATE.isShuttingDown) return;
+
   const sshArgs = [
     "-o", "BatchMode=yes",
     "-o", "StrictHostKeyChecking=accept-new",
@@ -278,28 +449,46 @@ async function executeServerTask(server: ServerStatus): Promise<void> {
 
   if (TARGET_COMMAND_TYPE !== "local") {
     server.currentPhase = "Checking SSH";
-    const authCmd = new Deno.Command("ssh", { args: [...sshArgs, "exit"], stdout: "null", stderr: "null" });
-    if (!(await authCmd.output()).success) {
+    try {
+      const authCmd = new Deno.Command("ssh", { 
+        args: [...sshArgs, "exit"], 
+        stdout: "null", 
+        stderr: "null",
+        signal: APP_STATE.abortController.signal
+      });
+      if (!(await authCmd.output()).success) {
+        server.status = "Failed";
+        server.outputBuffer.push("Auth failed. Missing/invalid SSH keys.");
+        return;
+      }
+    } catch (_e) {
+      if (APP_STATE.isShuttingDown) return;
       server.status = "Failed";
-      server.outputBuffer.push("Auth failed. Missing/invalid SSH keys.");
+      server.outputBuffer.push("SSH connection dropped.");
       return;
     }
   }
+
+  if (APP_STATE.isShuttingDown) return;
 
   // Idempotency check logic with FORCE override
   if (TARGET_CHECK_COMMAND && !IS_FORCED) {
     server.currentPhase = "Checking State";
     const renderedCheck = renderTemplate(TARGET_CHECK_COMMAND, server.config);
     
-    const checkCmd = TARGET_COMMAND_TYPE === "local" 
-      ? new Deno.Command("sh", { args: ["-c", renderedCheck], stdout: "null", stderr: "null" })
-      : new Deno.Command("ssh", { args: [...sshArgs, renderedCheck], stdout: "null", stderr: "null" });
+    try {
+      const checkCmd = TARGET_COMMAND_TYPE === "local" 
+        ? new Deno.Command("sh", { args: ["-c", renderedCheck], stdout: "null", stderr: "null", signal: APP_STATE.abortController.signal })
+        : new Deno.Command("ssh", { args: [...sshArgs, renderedCheck], stdout: "null", stderr: "null", signal: APP_STATE.abortController.signal });
 
-    if ((await checkCmd.output()).success) {
-      server.status = "Success";
-      server.currentPhase = "Success";
-      server.outputBuffer.push("State already met. Skipped.");
-      return;
+      if ((await checkCmd.output()).success) {
+        server.status = "Skipped"; 
+        server.currentPhase = "Success";
+        server.outputBuffer.push("State already met. Skipped.");
+        return;
+      }
+    } catch (_e) {
+      if (APP_STATE.isShuttingDown) return;
     }
   }
 
@@ -315,41 +504,64 @@ async function executeServerTask(server: ServerStatus): Promise<void> {
   }
 
   server.currentPhase = "Running";
-  const command = TARGET_COMMAND_TYPE === "local"
-    ? new Deno.Command("sh", { args: ["-c", renderedCommand], stdout: "piped", stderr: "piped" })
-    : new Deno.Command("ssh", { args: [...sshArgs, renderedCommand], stdout: "piped", stderr: "piped" });
+  
+  try {
+    const command = TARGET_COMMAND_TYPE === "local"
+      ? new Deno.Command("sh", { args: ["-c", renderedCommand], stdout: "piped", stderr: "piped", signal: APP_STATE.abortController.signal })
+      : new Deno.Command("ssh", { args: [...sshArgs, renderedCommand], stdout: "piped", stderr: "piped", signal: APP_STATE.abortController.signal });
 
-  const child = command.spawn();
+    const child = command.spawn();
 
-  const readStream = async (stream: ReadableStream<Uint8Array>, isErr: boolean) => {
-    const reader = stream.getReader();
-    const decoder = new TextDecoder();
-    let partial = "";
-    try {
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        const lines = (partial + decoder.decode(value, { stream: true })).split("\n");
-        partial = lines.pop() ?? "";
-        for (const line of lines) {
-          if (line.trim()) {
-            server.outputBuffer.push(line);
-            if (IS_VERBOSE) await logToFile(server.config.name, `${isErr ? "[STDERR]" : "[STDOUT]"} ${line.trim()}`);
+    const readStream = async (stream: ReadableStream<Uint8Array>, isErr: boolean) => {
+      const reader = stream.getReader();
+      const decoder = new TextDecoder();
+      let partial = "";
+      try {
+        while (true) {
+          if (APP_STATE.isShuttingDown) break; // Guard against reading after interrupt
+          const { value, done } = await reader.read();
+          if (done) break;
+          const lines = (partial + decoder.decode(value, { stream: true })).split("\n");
+          partial = lines.pop() ?? "";
+          for (const line of lines) {
+            if (line.trim()) {
+              server.outputBuffer.push(line);
+              if (IS_VERBOSE) await logToFile(server.config.name, `${isErr ? "[STDERR]" : "[STDOUT]"} ${line.trim()}`);
+            }
           }
         }
-      }
-    } finally { reader.releaseLock(); }
-  };
+      } catch (_e) {
+        // Handle abort errors silently
+      } finally { reader.releaseLock(); }
+    };
 
-  await Promise.all([readStream(child.stdout, false), readStream(child.stderr, true)]);
-  const success = (await child.status).success;
-  server.status = success ? "Success" : "Failed";
-  server.currentPhase = success ? "Success" : "Failed";
+    await Promise.all([readStream(child.stdout, false), readStream(child.stderr, true)]);
+    
+    if (APP_STATE.isShuttingDown) {
+      try { child.kill("SIGTERM"); } catch (_) {}
+      return; 
+    }
 
-  if (success && TARGET_POST_COMMAND) {
-    const renderedPost = renderTemplate(TARGET_POST_COMMAND, server.config, success ? "PASSED" : "FAILED");
+    const success = (await child.status).success;
+    server.status = success ? "Success" : "Failed";
+    server.currentPhase = success ? "Success" : "Failed";
+
+  } catch (_e) {
+    if (APP_STATE.isShuttingDown) return;
+    server.status = "Failed";
+    server.currentPhase = "Failed";
+    server.outputBuffer.push("Command execution failed or aborted.");
+  }
+
+  if (server.status === "Success" && TARGET_POST_COMMAND) {
+    const renderedPost = renderTemplate(TARGET_POST_COMMAND, server.config, "PASSED");
     try {
-      const postCmd = new Deno.Command("sh", { args: ["-c", renderedPost], stdout: "null", stderr: "piped" });
+      const postCmd = new Deno.Command("sh", { 
+        args: ["-c", renderedPost], 
+        stdout: "null", 
+        stderr: "piped",
+        signal: APP_STATE.abortController.signal 
+      });
       const postResult = await postCmd.output();
       if (!postResult.success) {
         const errText = new TextDecoder().decode(postResult.stderr).trim();
@@ -361,6 +573,7 @@ async function executeServerTask(server: ServerStatus): Promise<void> {
         }
       }
     } catch (e: any) {
+      if (APP_STATE.isShuttingDown) return;
       const failMsg = `[POST_COMMAND ERROR] ${e.message}`;
       if (IS_UNATTENDED) {
         await logToFile(server.config.name, failMsg);
@@ -373,8 +586,12 @@ async function executeServerTask(server: ServerStatus): Promise<void> {
 
 async function main() {
   try {
+    initDirectories();
+    await pruneOldLogs(); // Clean up old historical runs immediately
+
     const { options, args } = await new Command()
       .name("axon")
+      .version(VERSION)
       .description("Run commands on multiple servers based on tags.")
       .arguments('<command_name:string>')
       .option("-c, --config <file:string>", "Path to config", { default: `${HOME}/.axon_config.yml` })
@@ -427,33 +644,45 @@ async function main() {
       Deno.exit(0);
     }
 
-    const serverStatuses: ServerStatus[] = targetServers.map(config => ({
+    APP_STATE.servers = targetServers.map(config => ({
       config, status: "Success", currentPhase: "Queued", outputBuffer: ["Queued for execution."]
     }));
 
-    let uiInterval: ReturnType<typeof setInterval> | undefined;
-
     if (!IS_UNATTENDED) {
-      calculateLayout(serverStatuses.length);
+      calculateLayout(APP_STATE.servers.length);
       Terminal.enterAltScreen();
-      drawStaticLayout(serverStatuses);
-      uiInterval = setInterval(() => serverStatuses.forEach((s, i) => updateGridCell(s, i)), 100);
+      drawStaticLayout(APP_STATE.servers);
+      APP_STATE.uiInterval = setInterval(() => APP_STATE.servers.forEach((s, i) => updateGridCell(s, i)), 100);
     } else {
       await logToFile(AXON_LOG, `[Unattended Mode] Executing '${TARGET_COMMAND_NAME}'`);
     }
 
-    for (let i = 0; i < serverStatuses.length; i += 10) {
-      await Promise.all(serverStatuses.slice(i, i + 10).map(executeServerTask));
+    // Initialize Global Watchdog
+    const globalWatchdog = setTimeout(() => {
+      gracefulShutdown("Global Timeout");
+    }, GLOBAL_TIMEOUT_MS);
+
+    // Execution Chunker
+    for (let i = 0; i < APP_STATE.servers.length; i += 10) {
+      if (APP_STATE.isShuttingDown) break;
+      await Promise.all(APP_STATE.servers.slice(i, i + 10).map(executeServerTask));
     }
 
-    const failures = serverStatuses.filter(s => s.status === "Failed").length;
+    // Clear Watchdog upon natural completion
+    clearTimeout(globalWatchdog);
 
-    if (!IS_UNATTENDED) {
-      clearInterval(uiInterval);
-      serverStatuses.forEach((s, i) => updateGridCell(s, i));
-      
-      Terminal.write("\n\n" + colors.bold.cyan("Completed - Press any key to exit..."));
-      
+    // Stop the UI interval because tasks are done and data is static
+    if (APP_STATE.uiInterval) {
+      clearInterval(APP_STATE.uiInterval);
+      APP_STATE.uiInterval = undefined;
+    }
+    
+    // Mark as completed to protect the final prompt from resize events
+    APP_STATE.isCompleted = true;
+
+    // Wait for operator input before tearing down if UI is active
+    if (!APP_STATE.isShuttingDown && !IS_UNATTENDED) {
+      drawCompletionMessage();
       if (Deno.stdin.isTerminal()) {
         try { Deno.stdin.setRaw(true); } catch {}
         await Deno.stdin.read(new Uint8Array(1));
@@ -461,32 +690,15 @@ async function main() {
       } else {
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
-
-      Terminal.leaveAltScreen();
-      Terminal.showCursor();
-
-      console.log(colors.bold.cyan("\n=== Execution Summary ==="));
-      if (IS_DRY_RUN) console.log(colors.yellow("Note: This was a DRY RUN. No commands were actually executed."));
-      if (IS_FORCED) console.log(colors.red("Note: FORCE mode was active. Idempotency checks were bypassed."));
-      if (failures > 0) {
-        console.log(colors.red('Non-success servers:'));
-        serverStatuses.filter(s => s.status !== "Success").forEach(s => console.log(` - ${s.config.name}: ${s.status}`));
-      }
     }
 
-    await Deno.writeTextFile(`${LOG_DIR}/latest_run.json`, JSON.stringify(serverStatuses, null, 2));
-    Deno.exit(failures);
+    // Trigger graceful completion
+    await gracefulShutdown("Completed");
 
   } catch (error: any) {
-    if (!IS_UNATTENDED) { Terminal.leaveAltScreen(); Terminal.showCursor(); }
-    console.error(`\nCritical Exception: ${error.message}`);
-    Deno.exit(1);
+    console.error(colors.bgRed.white(`\n  Critical Exception: ${error.message}  `));
+    await gracefulShutdown("Error");
   }
 }
-
-Deno.addSignalListener("SIGINT", () => {
-  if (!IS_UNATTENDED) { Terminal.leaveAltScreen(); Terminal.showCursor(); }
-  Deno.exit(1);
-});
 
 await main();

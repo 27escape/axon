@@ -1,12 +1,12 @@
-#!/usr/bin/env -S deno run --allow-net --allow-write --allow-env --allow-sys
+#!/usr/bin/env -S deno run --allow-net --allow-sys --allow-env
 // axon_tui
 /**
  * Axon TUI: Event-Driven Terminal User Interface for Axon Daemon
  * Connects via MQTT to visualize parallel SSH deployments in real-time.
- * Features Continuous Dashboard monitoring and Auto-Discovery.
+ * Features Double-Buffered I/O, Layout Caching, and Continuous Dashboarding.
  */
 
-const VERSION = "7.2.0";
+const VERSION = "7.3.0";
 
 import { colors } from "./deps.ts";
 import mqtt from "npm:mqtt@^5.5.0";
@@ -26,18 +26,28 @@ let IS_FORCED = false;
 let IS_COMPLETED = false;
 let FINAL_SUMMARY: any = null;
 let ACTIVE_RUN_ID: string | null = null;
+let IS_LAYOUT_DRAWN = false;
 
 const MQTT_BROKER = Deno.env.get("MQTT_BROKER") || "mqtt://127.0.0.1:1883";
 
+// === Double-Buffered Terminal I/O ===
+let writeBuffer = "";
 const Terminal = {
   encoder: new TextEncoder(),
-  write: (text: string) => Deno.stdout.writeSync(Terminal.encoder.encode(text)),
-  enterAltScreen: () => Terminal.write("\x1b[?1049h"),
-  leaveAltScreen: () => Terminal.write("\x1b[?1049l"),
-  hideCursor: () => Terminal.write("\x1b[?25l"),
-  showCursor: () => Terminal.write("\x1b[?25h"),
-  clearScreen: () => Terminal.write("\x1b[2J"),
-  moveTo: (x: number, y: number) => Terminal.write(`\x1b[${y};${x}H`),
+  buffer: (text: string) => { writeBuffer += text; },
+  flush: () => {
+    if (writeBuffer.length > 0) {
+      Deno.stdout.writeSync(Terminal.encoder.encode(writeBuffer));
+      writeBuffer = "";
+    }
+  },
+  write: (text: string) => Terminal.buffer(text),
+  enterAltScreen: () => { Terminal.buffer("\x1b[?1049h"); Terminal.flush(); },
+  leaveAltScreen: () => { Terminal.buffer("\x1b[?1049l"); Terminal.flush(); },
+  hideCursor: () => { Terminal.buffer("\x1b[?25l"); Terminal.flush(); },
+  showCursor: () => { Terminal.buffer("\x1b[?25h"); Terminal.flush(); },
+  clearScreen: () => Terminal.buffer("\x1b[2J"),
+  moveTo: (x: number, y: number) => Terminal.buffer(`\x1b[${y};${x}H`),
 };
 
 const LAYOUT = {
@@ -63,7 +73,6 @@ function calculateLayout(serverCount: number): void {
 
 function drawStaticLayout(): void {
   Terminal.clearScreen();
-  Terminal.hideCursor();
   const cols = LAYOUT.cols;
   const rows = Math.ceil(LOCAL_STATE.length / cols);
   const innerW = LAYOUT.boxWidth - 2;
@@ -115,6 +124,7 @@ function updateGridCell(index: number): void {
   logsToDisplay.forEach((line, i) => {
     let clean = line.replace(/\t/g, "    ").trim();
     if (clean.length > innerW) clean = clean.substring(0, innerW - 3) + "...";
+    // padEnd ensures old longer log lines are safely overwritten with whitespace
     Terminal.moveTo(startX, startY + 2 + i); Terminal.write(colors.gray(clean.padEnd(innerW)));
   });
 }
@@ -125,7 +135,6 @@ function drawCompletionMessage(): void {
   const totalRows = Math.ceil(LOCAL_STATE.length / LAYOUT.cols);
   const bottomY = LAYOUT.startY(totalRows - 1) + LAYOUT.boxHeight + yOffset + 1;
   Terminal.moveTo(1, bottomY);
-  // Replaced blocking prompt with continuous dashboard prompt
   Terminal.write(colors.bold.cyan("Deployment Completed - Waiting for next run (Ctrl+C to exit)...") + " ".repeat(10));
 }
 
@@ -136,6 +145,7 @@ function handleResize(): void {
   drawStaticLayout();
   LOCAL_STATE.forEach((_, i) => updateGridCell(i));
   if (IS_COMPLETED) drawCompletionMessage();
+  Terminal.flush(); // Render entire resized frame atomically
 }
 
 try { Deno.addSignalListener("SIGWINCH", handleResize); } catch (_e) {}
@@ -178,7 +188,6 @@ async function main() {
 
   client.on('connect', () => {
     console.log(colors.green(`✓ Connected. Searching for active deployments...`));
-    // We subscribe to this permanently now to act as a continuous dashboard
     client.subscribe('axon/runs/latest');
   });
 
@@ -189,25 +198,24 @@ async function main() {
     if (topic === 'axon/runs/latest') {
       const data = JSON.parse(payload);
       
-      // Ignore if we receive the exact same run ID again
       if (ACTIVE_RUN_ID === data.run_id) return; 
       
-      // Cleanup previous subscriptions if a new run triggers
       if (ACTIVE_RUN_ID) {
         client.unsubscribe(`axon/run/${ACTIVE_RUN_ID}/state`);
         client.unsubscribe(`axon/run/${ACTIVE_RUN_ID}/status`);
       }
       
-      // Reset state for the new incoming run
       ACTIVE_RUN_ID = data.run_id;
       IS_COMPLETED = false;
       FINAL_SUMMARY = null;
       LOCAL_STATE = []; 
+      IS_LAYOUT_DRAWN = false; // Reset Layout Cache
       
       Terminal.enterAltScreen();
+      Terminal.hideCursor();
       Terminal.clearScreen();
+      Terminal.flush(); // Clear screen immediately
       
-      // Subscribe to the new deployment's channels
       client.subscribe(`axon/run/${ACTIVE_RUN_ID}/state`);
       client.subscribe(`axon/run/${ACTIVE_RUN_ID}/status`);
       return;
@@ -221,8 +229,15 @@ async function main() {
       IS_FORCED = data.isForced;
       
       calculateLayout(LOCAL_STATE.length);
-      drawStaticLayout();
+
+      // Layout Caching: Only draw the heavy borders if they haven't been drawn yet
+      if (!IS_LAYOUT_DRAWN) {
+        drawStaticLayout();
+        IS_LAYOUT_DRAWN = true;
+      }
+
       LOCAL_STATE.forEach((_, i) => updateGridCell(i));
+      Terminal.flush(); // Render all cell updates atomically
     }
 
     // === Step 3: Lifecycle Finalisation ===
@@ -232,9 +247,7 @@ async function main() {
         IS_COMPLETED = true;
         FINAL_SUMMARY = data;
         drawCompletionMessage();
-        
-        // Architecture Note: We INTENTIONALLY DO NOT exit here.
-        // We leave the final state visible and wait for a new 'latest' ping.
+        Terminal.flush(); // Render final text
       }
     }
   });

@@ -1,5 +1,4 @@
 // deps.ts
-export { parse as parseYaml } from "yaml";
-export { Secret } from "@cliffy/prompt/secret";
-export { colors } from "@cliffy/ansi/colors";
-export { Command } from "@cliffy/command";
+export { colors } from "https://deno.land/x/cliffy@v1.0.0-rc.4/ansi/colors.ts";
+export { parse as parseYaml } from "https://deno.land/std@0.224.0/yaml/mod.ts";
+export { Command } from "https://deno.land/x/cliffy@v1.0.0-rc.4/command/mod.ts";

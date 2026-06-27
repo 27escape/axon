@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Axon Control Plane</title>
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+  <style>
+    :root { --bg: #1e1e1e; --panel: #2d2d2d; --text: #d4d4d4; --green: #4CAF50; --red: #F44336; --cyan: #00bcd4; --dark: #111; }
+    body { background-color: var(--bg); color: var(--text); font-family: 'Courier New', Courier, monospace; margin: 0; padding: 20px; }
+    
+    /* --- Watchtower Status Indicators --- */
+    .status-dot { height: 10px; width: 10px; border-radius: 50%; display: inline-block; margin-right: 10px; box-shadow: 0 0 5px rgba(0,0,0,0.5); }
+    .status-online { background-color: var(--green); }
+    .status-offline { background-color: var(--red); }
+
+    /* --- Secure Login Overlay --- */
+    #login-overlay { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background-color: var(--bg); display: flex; flex-direction: column; justify-content: center; align-items: center; z-index: 1000; }
+    .login-box { background-color: var(--panel); padding: 40px; border-radius: 8px; border-top: 3px solid var(--cyan); text-align: center; width: 300px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
+    .login-box h2 { color: var(--cyan); margin-top: 0; }
+    .login-box input { width: 90%; padding: 10px; margin: 10px 0; background: var(--dark); border: 1px solid #444; color: var(--text); border-radius: 4px; font-family: inherit; }
+    .login-box button { width: 100%; margin-top: 15px; background-color: var(--cyan); padding: 12px; font-size: 1.1rem; border: none; font-weight: bold; cursor: pointer; border-radius: 4px;}
+    .login-box button:hover { background-color: #0097a7; }
+    .error-msg { color: var(--red); font-size: 0.9rem; margin-top: 10px; display: none; }
+
+    /* --- Dashboard Layout --- */
+    header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
+    h1 { color: var(--cyan); margin: 0; font-size: 1.5rem; }
+    .header-actions { display: flex; align-items: center; gap: 15px; }
+    .status-badge { background: #444; padding: 5px 10px; border-radius: 4px; font-size: 0.9rem; transition: background 0.3s;}
+    .secondary-btn { background-color: #555; color: white; border: none; padding: 5px 10px; cursor: pointer; border-radius: 4px; display: none; font-family: inherit;}
+    .secondary-btn:hover { background-color: #777; }
+    .logout-btn:hover { background-color: var(--red); }
+    
+    /* --- The Matrix Deck (Faceted Targeting) --- */
+    .matrix-deck { display: none; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; background: var(--panel); padding: 20px; border-radius: 8px; border-top: 3px solid var(--cyan); margin-bottom: 20px; }
+    .matrix-col { display: flex; flex-direction: column; height: 250px; }
+    .matrix-col-header { font-size: 0.85rem; color: #aaa; margin-bottom: 10px; font-weight: bold; border-bottom: 1px solid #444; padding-bottom: 5px; display: flex; justify-content: space-between; align-items: center;}
+    .matrix-list { overflow-y: auto; flex-grow: 1; display: flex; flex-direction: column; gap: 5px; padding-right: 5px; }
+    
+    .matrix-btn-small { background: none; border: 1px solid #555; color: #aaa; border-radius: 3px; cursor: pointer; font-size: 0.7rem; padding: 3px 6px; }
+    .matrix-btn-small.cyan { border-color: var(--cyan); color: var(--cyan); }
+    .matrix-btn-small:hover { background: #333; }
+
+    .matrix-item { background: var(--dark); border: 1px solid #444; padding: 8px 12px; border-radius: 4px; cursor: pointer; display: flex; align-items: center; transition: all 0.2s; user-select: none; }
+    .matrix-item:hover:not(.dimmed) { border-color: #777; }
+    .matrix-item.selected { background: #003333; border-color: var(--cyan); color: var(--cyan); }
+    .matrix-item.dimmed { opacity: 0.4; cursor: not-allowed; }
+    
+    .cmd-item { justify-content: center; font-weight: bold; background: #222; }
+    .cmd-item:hover:not(.dimmed) { background: var(--cyan); color: black; border-color: var(--cyan); }
+    
+    /* The Server Grid */
+    #grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(800px, 1fr)); gap: 20px; }
+    .server-card { background-color: var(--panel); border-top: 3px solid #555; padding: 15px; border-radius: 4px; width: 100%; box-sizing: border-box; }
+    .server-card.Success { border-top-color: var(--green); }
+    .server-card.Failed, .server-card.Offline, .server-card.Timeout { border-top-color: var(--red); }
+    .server-header { display: flex; justify-content: space-between; font-weight: bold; margin-bottom: 10px; border-bottom: 1px solid #444; padding-bottom: 5px;}
+    
+    /* Terminal Emulation: 80ch Width, 50 high */
+    .log-window { font-size: 0.85rem; color: #aaa; height: 50ch; overflow-y: auto; display: flex; flex-direction: column; justify-content: flex-start; }
+    .log-line { margin: 2px 0; max-width: 80ch; white-space: pre-wrap; word-wrap: break-word; font-family: 'Courier New', Courier, monospace; }
+
+    /* --- Form-Driven Config UI --- */
+    #editor-modal { display: none; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.85); justify-content: center; align-items: center; z-index: 2000; }
+    .editor-content { background: var(--bg); border: 1px solid #444; padding: 20px; border-radius: 8px; width: 90%; max-width: 900px; height: 80vh; display: flex; flex-direction: column; }
+    .editor-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 15px; }
+    .editor-header h2 { margin: 0; color: var(--cyan); }
+    
+    .tabs { display: flex; gap: 10px; }
+    .tab-btn { background: #333; color: white; border: none; padding: 8px 15px; cursor: pointer; border-radius: 4px; font-family: inherit; }
+    .tab-btn.active { background: var(--cyan); color: black; font-weight: bold; }
+    
+    .editor-body { flex-grow: 1; overflow-y: auto; background: var(--panel); padding: 15px; border-radius: 4px; margin-bottom: 15px; position: relative; }
+    
+    .list-item { display: flex; justify-content: space-between; align-items: center; background: var(--dark); padding: 10px 15px; margin-bottom: 8px; border-radius: 4px; border-left: 3px solid #555; }
+    .list-item-title { font-weight: bold; font-size: 1.1rem; color: var(--cyan); }
+    .list-item-meta { font-size: 0.85rem; color: #888; margin-top: 5px; }
+    
+    .crud-form { display: none; flex-direction: column; gap: 15px; }
+    .form-group { display: flex; flex-direction: column; gap: 5px; }
+    .form-group label { font-weight: bold; color: #aaa; font-size: 0.9rem; }
+    .form-group input[type="text"], .form-group select { background: var(--dark); color: white; border: 1px solid #555; padding: 10px; border-radius: 4px; font-family: inherit; }
+    .form-group input[type="checkbox"] { width: 20px; height: 20px; cursor: pointer; }
+    
+    .editor-actions { display: flex; justify-content: flex-end; gap: 10px; border-top: 1px solid #444; padding-top: 15px; }
+    .save-commit-btn { background-color: var(--green); color: white; font-weight: bold; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-family: inherit; }
+    .save-commit-btn:hover { background-color: #388E3C; }
+    
+    .tag-badge { background: #444; padding: 2px 6px; border-radius: 3px; font-size: 0.8rem; margin-right: 5px; }
+  </style>
+</head>
+<body>
+
+  <div id="login-overlay">
+    <div class="login-box">
+      <h2>AXON GATEWAY</h2>
+      <input type="text" id="username" placeholder="Username" autocomplete="off" />
+      <input type="password" id="password" placeholder="Password" />
+      <button id="login-btn" onclick="attemptLogin()">Connect</button>
+      <div id="login-error" class="error-msg">Connection Refused: Not Authorized.</div>
+    </div>
+  </div>
+
+  <header>
+    <h1>AXON // Control Plane</h1>
+    <div class="header-actions">
+      <div id="conn-status" class="status-badge">Disconnected</div>
+      <button id="edit-config-btn" class="secondary-btn" onclick="openConfigManager()">Manager</button>
+      <button id="logout-btn" class="secondary-btn logout-btn" onclick="logout('Manual Logout')">Logout</button>
+    </div>
+  </header>
+
+  <div id="matrix-deck" class="matrix-deck">
+    
+    <div class="matrix-col">
+      <div class="matrix-col-header">
+        <span>1. FILTER BY TAG</span>
+        <div style="display: flex; gap: 5px;">
+          <button class="matrix-btn-small cyan" onclick="selectAllTags()">Select All</button>
+          <button class="matrix-btn-small" onclick="clearTags()">Clear</button>
+        </div>
+      </div>
+      <div id="matrix-tags" class="matrix-list"></div>
+    </div>
+
+    <div class="matrix-col">
+      <div class="matrix-col-header">
+        <span>2. SELECT SERVERS</span>
+        <div style="display: flex; gap: 5px;">
+          <button class="matrix-btn-small cyan" onclick="selectAllServers()">Select All</button>
+          <button class="matrix-btn-small" onclick="clearServers()">Clear</button>
+        </div>
+      </div>
+      <div id="matrix-servers" class="matrix-list"></div>
+    </div>
+
+    <div class="matrix-col">
+      <div class="matrix-col-header"><span>3. DISPATCH ACTION</span></div>
+      <div id="matrix-commands" class="matrix-list"></div>
+    </div>
+
+  </div>
+  
+  <div style="margin-bottom: 20px;">
+    <span id="run-id-display" style="color: var(--cyan);">Awaiting telemetry stream...</span>
+  </div>
+
+  <div id="grid"></div>
+
+  <div id="editor-modal">
+    <div class="editor-content">
+      <div class="editor-header">
+        <h2>Configuration Manager</h2>
+        <div class="tabs">
+          <button id="tab-btn-servers" class="tab-btn active" onclick="switchTab('servers')">Servers</button>
+          <button id="tab-btn-commands" class="tab-btn" onclick="switchTab('commands')">Commands</button>
+        </div>
+      </div>
+      
+      <div class="editor-body">
+        <div id="list-view">
+          <div style="margin-bottom: 15px; display: flex; justify-content: flex-end;">
+            <button class="save-commit-btn" style="background:var(--cyan); color:black;" onclick="openForm()">+ Add New</button>
+          </div>
+          <div id="items-list"></div>
+        </div>
+
+        <div id="server-form" class="crud-form">
+          <input type="hidden" id="server-idx">
+          <div class="form-group"><label>Server Name</label><input type="text" id="server-name" placeholder="e.g., macmini.local"></div>
+          <div class="form-group"><label>IP Address / Hostname</label><input type="text" id="server-ip" placeholder="e.g., 192.168.1.10"></div>
+          <div class="form-group"><label>SSH User</label><input type="text" id="server-user" placeholder="e.g., root"></div>
+          <div class="form-group"><label>Tags (Comma Separated)</label><input type="text" id="server-tags" placeholder="e.g., pi, web, prod"></div>
+          <div class="form-group" style="flex-direction: row; align-items: center;"><label>Active Status</label><input type="checkbox" id="server-active"></div>
+          <div style="margin-top: 15px; display: flex; gap: 10px;">
+            <button class="save-commit-btn" style="background:var(--cyan); color:black;" onclick="saveServerToMemory()">Done</button>
+            <button class="secondary-btn" style="display:block;" onclick="cancelForm()">Cancel</button>
+          </div>
+        </div>
+
+        <div id="command-form" class="crud-form">
+          <input type="hidden" id="command-idx">
+          <div class="form-group"><label>Command Name</label><input type="text" id="command-name" placeholder="e.g., update_system"></div>
+          <div class="form-group"><label>Execution String</label><input type="text" id="command-exec" placeholder="e.g., apt-get update && apt-get upgrade -y"></div>
+          <div class="form-group"><label>Execution Type</label>
+            <select id="command-type"><option value="remote">Remote (SSH)</option><option value="local">Local (Shell)</option></select>
+          </div>
+          <div class="form-group"><label>Check Command (Optional Idempotency)</label><input type="text" id="command-check" placeholder="e.g., systemctl is-active docker"></div>
+          <div class="form-group"><label>Target Tags (Comma Separated)</label><input type="text" id="command-tags" placeholder="e.g., pi, web"></div>
+          <div style="margin-top: 15px; display: flex; gap: 10px;">
+            <button class="save-commit-btn" style="background:var(--cyan); color:black;" onclick="saveCommandToMemory()">Done</button>
+            <button class="secondary-btn" style="display:block;" onclick="cancelForm()">Cancel</button>
+          </div>
+        </div>
+      </div>
+      
+      <div class="editor-actions">
+        <button class="secondary-btn" style="display:block;" onclick="closeConfigManager()">Close Without Saving</button>
+        <button class="save-commit-btn" onclick="commitConfigToServer()">Save & Apply to Engine</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let client = null;
+    let activeRunId = null;
+    let currentUser = null;
+    let currentPass = null;
+    let systemConfig = null;
+    let currentTab = 'servers';
+    
+    // Matrix State & Watchtower State
+    let activeTags = new Set();
+    let activeServers = new Set();
+    let fleetHealth = {}; // Maps server name to "Online" or "Offline"
+
+    // --- Idle & SSE Logic ---
+    let idleTimer;
+    function resetIdleTimer() { 
+      clearTimeout(idleTimer); 
+      if (currentUser) {
+        idleTimer = setTimeout(() => logout("Session Expired"), 5 * 60 * 1000); 
+      }
+    }
+    
+    window.addEventListener('mousemove', resetIdleTimer); 
+    window.addEventListener('keypress', resetIdleTimer); 
+    window.addEventListener('click', resetIdleTimer);
+
+    const sse = new EventSource('/live-reload');
+    sse.onmessage = (e) => {
+      if (e.data === 'reload' && currentUser) {
+        sessionStorage.setItem('axon_user', currentUser); 
+        sessionStorage.setItem('axon_pass', currentPass);
+        window.location.reload();
+      }
+    };
+    
+    window.onload = () => {
+      if (sessionStorage.getItem('axon_user')) {
+        document.getElementById('username').value = sessionStorage.getItem('axon_user');
+        document.getElementById('password').value = sessionStorage.getItem('axon_pass');
+        attemptLogin(); 
+        sessionStorage.clear();
+      }
+    };
+
+    document.getElementById('password').addEventListener('keypress', (e) => { 
+      if (e.key === 'Enter') attemptLogin(); 
+    });
+
+    // --- Core Architecture ---
+    async function attemptLogin() {
+      const user = document.getElementById('username').value.trim();
+      const pass = document.getElementById('password').value;
+      
+      if (!user || !pass) return;
+
+      document.getElementById('login-btn').innerText = "Authenticating...";
+      const BROKER_URL = `ws://${window.location.hostname}:9002`;
+      client = mqtt.connect(BROKER_URL, { username: user, password: pass, reconnectPeriod: 0 });
+
+      client.on('connect', () => {
+        currentUser = user; 
+        currentPass = pass;
+        document.getElementById('login-overlay').style.display = 'none';
+        document.getElementById('conn-status').innerText = `Connected as ${user}`;
+        document.getElementById('conn-status').style.background = 'var(--green)';
+        document.getElementById('logout-btn').style.display = 'block';
+        client.options.reconnectPeriod = 1000;
+        
+        // Subscribe to execution state AND fleet health
+        client.subscribe(['axon/runs/latest', 'axon/fleet/health']);
+        resetIdleTimer(); 
+        fetchConfig();
+      });
+
+      client.on('error', () => {
+        if (client) client.end();
+        document.getElementById('login-btn').innerText = "Connect";
+        document.getElementById('login-error').style.display = "block";
+      });
+
+      client.on('message', (topic, message) => {
+        const data = JSON.parse(message.toString());
+        
+        // Process Watchtower Health updates
+        if (topic === 'axon/fleet/health') {
+          fleetHealth = data.status;
+          // RACE CONDITION FIX: Do not render matrix if config is still downloading
+          if (systemConfig) {
+            renderMatrix();
+          }
+        }
+
+        // Process Execution updates
+        if (topic === 'axon/runs/latest') {
+          if (activeRunId !== data.run_id) {
+            if (activeRunId) client.unsubscribe(`axon/run/${activeRunId}/state`);
+            activeRunId = data.run_id;
+            document.getElementById('run-id-display').innerText = `Active Run: ${activeRunId}`;
+            client.subscribe(`axon/run/${activeRunId}/state`);
+          }
+        }
+        
+        if (topic.includes('/state')) {
+          renderGrid(data.state);
+        }
+      });
+    }
+
+    function logout(reason = "Disconnected") {
+      clearTimeout(idleTimer); 
+      if (client) client.end(true); 
+      
+      client = activeRunId = currentUser = currentPass = systemConfig = null;
+      activeTags.clear(); 
+      activeServers.clear(); 
+      fleetHealth = {};
+      
+      document.getElementById('login-overlay').style.display = 'flex';
+      ['username','password'].forEach(id => document.getElementById(id).value = '');
+      document.getElementById('login-btn').innerText = 'Connect';
+      document.getElementById('conn-status').innerText = reason;
+      document.getElementById('conn-status').style.background = '#444';
+      ['logout-btn','edit-config-btn','matrix-deck'].forEach(id => document.getElementById(id).style.display = 'none');
+      document.getElementById('grid').innerHTML = '';
+    }
+
+    async function fetchConfig() {
+      try {
+        const res = await fetch('/api/config', { 
+          headers: { 'Authorization': `Basic ${btoa(`${currentUser}:${currentPass}`)}` }
+        });
+        if (!res.ok) throw new Error("Fetch failed");
+        systemConfig = await res.json();
+        renderMatrix();
+      } catch (e) { 
+        document.getElementById('run-id-display').innerText = "Error loading configuration."; 
+      }
+    }
+
+    // --- MATRIX DECK LOGIC (Strict AND Logic + Intelligent Bulk Selections) ---
+    
+    function clearTags() { 
+      activeTags.clear(); 
+      renderMatrix(); 
+    }
+    
+    function clearServers() { 
+      activeServers.clear(); 
+      renderMatrix(); 
+    }
+    
+    function toggleTag(t) { 
+      activeTags.has(t) ? activeTags.delete(t) : activeTags.add(t); 
+      renderMatrix(); 
+    }
+    
+    function toggleServer(s) { 
+      activeServers.has(s) ? activeServers.delete(s) : activeServers.add(s); 
+      renderMatrix(); 
+    }
+
+    function selectAllTags() {
+      let targetPool = systemConfig.servers;
+      // Intelligently select all tags that apply to the currently selected servers
+      if (activeServers.size > 0) {
+        targetPool = systemConfig.servers.filter(s => activeServers.has(s.name));
+      }
+      targetPool.forEach(s => {
+        s.tags.forEach(t => activeTags.add(t));
+      });
+      renderMatrix();
+    }
+
+    function selectAllServers() {
+      let targetPool = systemConfig.servers;
+      // Intelligently select all servers that match the currently selected tags
+      if (activeTags.size > 0) {
+        targetPool = systemConfig.servers.filter(s => s.tags.some(t => activeTags.has(t)));
+      }
+      // Only select servers that are currently Online
+      targetPool.forEach(s => {
+        if (fleetHealth[s.name] === 'Online') {
+          activeServers.add(s.name);
+        }
+      });
+      renderMatrix();
+    }
+
+    function renderMatrix() {
+      if (!systemConfig || currentUser !== 'axon_admin') return;
+      
+      document.getElementById('matrix-deck').style.display = 'grid';
+      document.getElementById('edit-config-btn').style.display = 'block';
+
+      const tagContainer = document.getElementById('matrix-tags');
+      const serverContainer = document.getElementById('matrix-servers');
+      const cmdContainer = document.getElementById('matrix-commands');
+      
+      tagContainer.innerHTML = ''; 
+      serverContainer.innerHTML = ''; 
+      cmdContainer.innerHTML = '';
+
+      const hasExplicitTargets = activeTags.size > 0 || activeServers.size > 0;
+
+      // Determine the Active Target Pool using STRICT INTERSECTION (AND)
+      let targetPool = systemConfig.servers;
+      
+      if (activeTags.size > 0 && activeServers.size > 0) {
+        // Must match a selected tag AND be a selected server
+        targetPool = systemConfig.servers.filter(s => activeServers.has(s.name) && s.tags.some(t => activeTags.has(t)));
+      } else if (activeServers.size > 0) {
+        targetPool = systemConfig.servers.filter(s => activeServers.has(s.name));
+      } else if (activeTags.size > 0) {
+        targetPool = systemConfig.servers.filter(s => s.tags.some(t => activeTags.has(t)));
+      }
+
+      // Gather tags present in the finalized target pool
+      const poolTags = new Set();
+      targetPool.forEach(s => s.tags.forEach(t => poolTags.add(t)));
+
+      // Gather all possible tags to iterate over
+      const allTags = new Set();
+      systemConfig.servers.forEach(s => s.tags.forEach(t => allTags.add(t)));
+
+      // 1. Render Tags Column
+      allTags.forEach(t => {
+        const isSelected = activeTags.has(t);
+        const isDimmed = !isSelected && hasExplicitTargets && !poolTags.has(t);
+        
+        const div = document.createElement('div');
+        div.className = `matrix-item ${isSelected ? 'selected' : ''} ${isDimmed ? 'dimmed' : ''}`;
+        div.innerHTML = `<input type="checkbox" ${isSelected ? 'checked' : ''} style="margin-right:10px; pointer-events:none;"> ${t}`;
+        div.onclick = () => toggleTag(t);
+        tagContainer.appendChild(div);
+      });
+
+      // 2. Render Servers Column (WITH HEALTH WATCHTOWER)
+      systemConfig.servers.forEach(s => {
+        const isSelected = activeServers.has(s.name);
+        const isInPool = targetPool.some(ts => ts.name === s.name);
+        
+        // Fetch health status from Watchtower logic
+        const status = fleetHealth[s.name] || 'Offline';
+        const isOnline = status === 'Online';
+        
+        // A server is dimmed if it's filtered out by tags OR if it's currently offline
+        const isDimmed = (!isSelected && hasExplicitTargets && !isInPool) || !isOnline;
+        
+        const div = document.createElement('div');
+        div.className = `matrix-item ${isSelected ? 'selected' : ''} ${isDimmed ? 'dimmed' : ''}`;
+        
+        const dotClass = isOnline ? 'status-online' : 'status-offline';
+        div.innerHTML = `<span class="status-dot ${dotClass}"></span><input type="checkbox" ${isSelected ? 'checked' : ''} style="margin-right:10px; pointer-events:none;"> ${s.name}`;
+        
+        div.onclick = () => {
+          if (!isOnline) {
+            alert(`Cannot select ${s.name}. Watchtower reports it is Offline.`);
+            return;
+          }
+          toggleServer(s.name);
+        };
+        serverContainer.appendChild(div);
+      });
+
+      // 3. Render Commands Column
+      systemConfig.commands.forEach(cmd => {
+        const isValid = !hasExplicitTargets || cmd.tags.some(t => poolTags.has(t));
+        
+        const div = document.createElement('div');
+        div.className = `matrix-item cmd-item ${!isValid ? 'dimmed' : ''}`;
+        div.innerHTML = `${cmd.name}`;
+        div.onclick = () => {
+          if (isValid) dispatchMatrixCommand(cmd.name);
+        };
+        cmdContainer.appendChild(div);
+      });
+    }
+
+    function dispatchMatrixCommand(cmdName) {
+      if (!client || !client.connected) return;
+      
+      let targets = {};
+      if (activeTags.size > 0 || activeServers.size > 0) {
+        targets.tags = Array.from(activeTags);
+        targets.servers = Array.from(activeServers);
+      }
+      
+      client.publish('axon/control/dispatch', JSON.stringify({ command: cmdName, targets, triggeredBy: currentUser }), { qos: 1 });
+      
+      // State is intentionally preserved here for rapid-fire execution against complex targets
+    }
+
+    function renderGrid(servers) {
+      const grid = document.getElementById('grid'); 
+      grid.innerHTML = ''; 
+      
+      servers.forEach(server => {
+        const phaseClass = ["Success", "Failed", "Offline", "Timeout"].includes(server.status) ? server.status : "Running";
+        const statusText = server.status === "Success" && server.currentPhase !== "Success" ? server.currentPhase : server.status;
+        
+        let logsHtml = ''; 
+        server.outputBuffer.forEach(log => {
+          logsHtml += `<div class="log-line">> ${log}</div>`
+        });
+        
+        const card = document.createElement('div'); 
+        card.className = `server-card ${phaseClass}`;
+        card.innerHTML = `
+          <div class="server-header">
+            <span>${server.config.name} (${server.config.ip})</span>
+            <span>${statusText}</span>
+          </div>
+          <div class="log-window">${logsHtml}</div>
+        `;
+        grid.appendChild(card);
+
+        // Scroll the terminal to the bottom so the latest output is always visible
+        const logWindow = card.querySelector('.log-window');
+        if (logWindow) logWindow.scrollTop = logWindow.scrollHeight;
+      });
+    }
+
+    // --- Form-Driven Config Manager Logic ---
+    function openConfigManager() { 
+      document.getElementById('editor-modal').style.display = 'flex'; 
+      switchTab('servers'); 
+    }
+    
+    function closeConfigManager() { 
+      document.getElementById('editor-modal').style.display = 'none'; 
+      fetchConfig(); 
+    } 
+
+    function switchTab(tab) {
+      currentTab = tab;
+      document.getElementById('tab-btn-servers').className = `tab-btn ${tab === 'servers' ? 'active' : ''}`;
+      document.getElementById('tab-btn-commands').className = `tab-btn ${tab === 'commands' ? 'active' : ''}`;
+      renderList();
+    }
+
+    function renderList() {
+      document.getElementById('server-form').style.display = 'none'; 
+      document.getElementById('command-form').style.display = 'none';
+      document.getElementById('list-view').style.display = 'block';
+      
+      const list = document.getElementById('items-list'); 
+      list.innerHTML = '';
+      
+      systemConfig[currentTab].forEach((item, idx) => {
+        const meta = currentTab === 'servers' 
+          ? `${item.ip} | User: ${item.user} | ${item.active ? '🟢 Active' : '🔴 Inactive'}` 
+          : `Exec: ${item.command}`;
+        
+        const tagsHtml = item.tags.map(t => `<span class="tag-badge">${t}</span>`).join('');
+        
+        list.innerHTML += `
+          <div class="list-item">
+            <div>
+              <div class="list-item-title">${item.name}</div>
+              <div class="list-item-meta">${meta}</div>
+              <div style="margin-top:5px;">${tagsHtml}</div>
+            </div>
+            <div>
+              <button class="secondary-btn" style="display:inline-block;" onclick="editItem(${idx})">Edit</button> 
+              <button class="secondary-btn" style="display:inline-block; background:var(--red);" onclick="deleteItem(${idx})">Del</button>
+            </div>
+          </div>
+        `;
+      });
+    }
+
+    function openForm(idx = -1) {
+      document.getElementById('list-view').style.display = 'none';
+      
+      if (currentTab === 'servers') {
+        document.getElementById('server-form').style.display = 'flex';
+        const s = idx >= 0 ? systemConfig.servers[idx] : { name: '', ip: '', user: 'root', tags: [], active: true };
+        document.getElementById('server-idx').value = idx; 
+        document.getElementById('server-name').value = s.name;
+        document.getElementById('server-ip').value = s.ip; 
+        document.getElementById('server-user').value = s.user;
+        document.getElementById('server-tags').value = s.tags.join(', '); 
+        document.getElementById('server-active').checked = s.active;
+      } else {
+        document.getElementById('command-form').style.display = 'flex';
+        const c = idx >= 0 ? systemConfig.commands[idx] : { name: '', command: '', type: 'remote', check_command: '', tags: [] };
+        document.getElementById('command-idx').value = idx; 
+        document.getElementById('command-name').value = c.name;
+        document.getElementById('command-exec').value = c.command; 
+        document.getElementById('command-type').value = c.type || 'remote';
+        document.getElementById('command-check').value = c.check_command || ''; 
+        document.getElementById('command-tags').value = c.tags.join(', ');
+      }
+    }
+
+    function editItem(idx) { 
+      openForm(idx); 
+    }
+    
+    function deleteItem(idx) { 
+      if(confirm("Delete this item?")) { 
+        systemConfig[currentTab].splice(idx, 1); 
+        renderList(); 
+      } 
+    }
+    
+    function cancelForm() { 
+      renderList(); 
+    }
+
+    function saveServerToMemory() {
+      const idx = parseInt(document.getElementById('server-idx').value);
+      const name = document.getElementById('server-name').value.trim();
+      if (!name) return alert("Server Name is required.");
+      
+      const server = { 
+        name, 
+        ip: document.getElementById('server-ip').value.trim(), 
+        user: document.getElementById('server-user').value.trim(), 
+        tags: document.getElementById('server-tags').value.split(',').map(t => t.trim()).filter(t => t), 
+        active: document.getElementById('server-active').checked 
+      };
+      
+      if (idx >= 0) {
+        systemConfig.servers[idx] = server;
+      } else {
+        systemConfig.servers.push(server);
+      }
+      renderList();
+    }
+
+    function saveCommandToMemory() {
+      const idx = parseInt(document.getElementById('command-idx').value);
+      const name = document.getElementById('command-name').value.trim();
+      if (!name) return alert("Command Name is required.");
+      
+      const command = { 
+        name, 
+        command: document.getElementById('command-exec').value.trim(), 
+        type: document.getElementById('command-type').value, 
+        check_command: document.getElementById('command-check').value.trim(), 
+        tags: document.getElementById('command-tags').value.split(',').map(t => t.trim()).filter(t => t) 
+      };
+      
+      if (idx >= 0) {
+        systemConfig.commands[idx] = command;
+      } else {
+        systemConfig.commands.push(command);
+      }
+      renderList();
+    }
+
+    async function commitConfigToServer() {
+      try {
+        const res = await fetch('/api/config', { 
+          method: 'POST', 
+          headers: { 
+            'Authorization': `Basic ${btoa(`${currentUser}:${currentPass}`)}`, 
+            'Content-Type': 'application/json' 
+          }, 
+          body: JSON.stringify(systemConfig) 
+        });
+        
+        if (!res.ok) throw new Error(await res.text());
+        closeConfigManager(); 
+        renderMatrix();
+      } catch (e) { 
+        alert("Failed to save config: " + e.message); 
+      }
+    }
+  </script>
+</body>
+</html>

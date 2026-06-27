@@ -1,0 +1,97 @@
+commands:
+  - name: update
+    aliases:
+      - upgrade
+    command: sudo sh -c "apt update && apt upgrade -y && apt autoremove -y"
+    tags:
+      - linux
+      - pi
+  - name: ping
+    aliases:
+      - isalive
+    command: echo "pong"
+    tags:
+      - linux
+      - pi
+      - osx
+  - name: reboot
+    command: sudo reboot
+    tags:
+      - pi
+  - name: brew-update
+    aliases:
+      - brew-upgrade
+      - brewup
+    command: brew update && brew upgrade
+    tags:
+      - osx
+  - name: deno-update
+    aliases:
+      - deno-upgrade
+    command: deno upgrade
+    tags:
+      - osx
+  - name: PS
+    command: sudo ps ax
+    type: remote
+    tags:
+      - pi
+
+  - name: push-gnarlypi
+    type: local
+    command: '{{home}}/Repos/personal/python/gnarlypi/sync.sh {{ip}}'
+    tags:
+      - pi
+
+  - name: pull-syslogs
+    type: local
+    command: 'scp {{user}}@{{ip}}:/var/log/syslog {{downloads}}/{{server_name}}_syslog.log'
+    tags:
+      - pi
+
+
+
+servers:
+  - name: macmini.local
+    ip: 127.0.0.1
+    user: kevinmu
+    active: true
+    tags:
+      - osx
+  - name: photos.local
+    ip: 192.168.0.172
+    user: kevinmu
+    active: true
+    tags:
+      - pi
+      - linux
+  - name: backup.local
+    ip: 192.168.0.145
+    user: kevinmu
+    active: true
+    tags:
+      - pi
+      - pi5
+      - linux
+  - name: micro.local
+    ip: 192.168.0.99
+    user: kevinmu
+    active: true
+    tags:
+      - pi
+      - pizero2w
+      - linux
+  - name: homeassistant.local
+    ip: 192.168.0.222
+    user: kevinmu
+    active: true
+    tags:
+      - pi
+      - pi5
+      - linux
+  - name: newbackup
+    ip: 192.168.0.70
+    user: kevinmu
+    active: false
+    tags:
+      - linux

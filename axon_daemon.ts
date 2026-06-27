@@ -1,38 +1,19 @@
 #!/usr/bin/env -S deno run --allow-read --allow-env --allow-run --allow-write --allow-net --allow-sys
 // axon_daemon
 /**
- * Axon Daemon: Multi-Node Parallel SSH Executor (MQTT Event-Driven Engine)
- * Features tag-based routing, custom tslog integration, and MQTT Pub/Sub for TUI state.
+ * Axon Daemon: Multi-Node Parallel SSH Executor (Enterprise Control Plane)
+ * Phase 10: Watchtower Background Health Monitoring + Strict AND Targeting Logic.
  */
 
-const VERSION = "7.1.0";
+const VERSION = "10.0.1";
 
 import { colors, Command, parseYaml } from "./deps.ts";
 import mqtt from "npm:mqtt@^5.5.0";
 import { logger, setLogLevel, setLogFile } from "../various_tools/lib/logger.ts";
 
-interface CommandConfig {
-  name: string;
-  aliases?: string[];
-  check_command?: string;
-  command: string;
-  post_command?: string;
-  tags: string[];
-  type?: "remote" | "local";
-}
-
-interface ServerConfig {
-  name: string;
-  ip: string;
-  user: string;
-  active: boolean;
-  tags: string[];
-}
-
-interface YamlConfig {
-  commands: CommandConfig[];
-  servers: ServerConfig[];
-}
+interface CommandConfig { name: string; aliases?: string[]; check_command?: string; command: string; post_command?: string; tags: string[]; type?: "remote" | "local"; }
+interface ServerConfig { name: string; ip: string; user: string; active: boolean; tags: string[]; }
+interface YamlConfig { commands: CommandConfig[]; servers: ServerConfig[]; }
 
 interface ServerStatus {
   config: ServerConfig;
@@ -41,239 +22,283 @@ interface ServerStatus {
   outputBuffer: string[];
 }
 
-// --- Global Application State ---
-const RUN_ID = `run_${new Date().toISOString().replace(/[-:]/g, "").split(".")[0]}_${Math.floor(Math.random() * 1000)}`;
-const MQTT_BROKER = Deno.env.get("MQTT_BROKER") || "mqtt://127.0.0.1:1883";
+interface DispatchPayload { 
+  command: string; 
+  targets?: { servers?: string[]; tags?: string[] }; 
+  triggeredBy?: string; 
+  isDryRun?: boolean; 
+  isForced?: boolean; 
+}
 
-const APP_STATE = {
-  isShuttingDown: false,
-  servers: [] as ServerStatus[],
-  abortController: new AbortController(),
-  mqttClient: mqtt.connect(MQTT_BROKER, { clientId: `axon_daemon_${RUN_ID}`, connectTimeout: 5000 })
-};
-
+// --- Global Daemon State ---
+const DAEMON_ID = `daemon_${new Date().toISOString().replace(/[-:]/g, "").split(".")[0]}`;
+const MQTT_BROKER = Deno.env.get("MQTT_BROKER") || "mqtt://127.0.0.1:8884";
+const MQTT_USER = Deno.env.get("MQTT_USER") || "axon_engine";
+const MQTT_PASS = Deno.env.get("MQTT_PASS") || "engine123";
 const GLOBAL_TIMEOUT_MS = 10 * 60 * 1000;
 
+const DAEMON_STATE = {
+  isShuttingDown: false,
+  mqttClient: mqtt.connect(MQTT_BROKER, { clientId: `axon_${DAEMON_ID}`, username: MQTT_USER, password: MQTT_PASS, connectTimeout: 5000 }),
+  parsedConfig: null as YamlConfig | null,
+  configPath: ""
+};
+
+// --- FIFO Queue State ---
+const JOB_QUEUE: DispatchPayload[] = [];
+let IS_PROCESSING = false;
+
+interface ActiveJob { 
+  runId: string; 
+  payload: DispatchPayload; 
+  cmdConfig: CommandConfig; 
+  servers: ServerStatus[]; 
+  abortController: AbortController; 
+  timeoutWatchdog?: number; 
+}
+let ACTIVE_JOB: ActiveJob | null = null;
+
 // --- Directory Setup & Tier 1 Persistence ---
-const USER = Deno.env.get("USER") || "default";
 const HOME = Deno.env.get("HOME") || "/root";
 const STATE_DIR = `${HOME}/.local/state/axon`;
 const LOG_DIR = `${STATE_DIR}/logs`;
 const DOWNLOADS_DIR = `${STATE_DIR}/downloads`;
 
 function initDirectories() {
-  try {
-    Deno.mkdirSync(LOG_DIR, { recursive: true });
-    Deno.mkdirSync(DOWNLOADS_DIR, { recursive: true });
-    // Attach the custom logger to the log directory
-    setLogFile(`${LOG_DIR}/axon_daemon`);
-  } catch (_e) {}
+  try { 
+    Deno.mkdirSync(LOG_DIR, { recursive: true }); 
+    Deno.mkdirSync(DOWNLOADS_DIR, { recursive: true }); 
+    setLogFile(`${LOG_DIR}/axon_daemon`); 
+  } catch (_e) {
+    // Directories likely already exist
+  }
 }
 
-async function pruneOldLogs() {
-  try {
-    const files = [];
-    for await (const dirEntry of Deno.readDir(LOG_DIR)) {
-      if (dirEntry.isFile && dirEntry.name.startsWith("run_") && dirEntry.name.endsWith(".json")) {
-        const stat = await Deno.stat(`${LOG_DIR}/${dirEntry.name}`);
-        files.push({ name: dirEntry.name, time: stat.mtime?.getTime() || 0 });
-      }
-    }
-    files.sort((a, b) => b.time - a.time);
-    const toDelete = files.slice(10);
-    for (const file of toDelete) {
-      await Deno.remove(`${LOG_DIR}/${file.name}`).catch(() => {});
-    }
-  } catch (_e) {}
-}
-
-// --- YAML & Utility Functions ---
-function validateYamlConfig(data: unknown, source: string): asserts data is YamlConfig {
+// --- Configuration Engine (Hot-Reloading) ---
+function validateYamlConfig(data: unknown): asserts data is YamlConfig {
   if (!data || typeof data !== "object" || Array.isArray(data)) {
-    logger.fatal(`Invalid YAML structure in ${source}. Expected an object with 'commands' and 'servers'.`);
-    Deno.exit(1);
+    throw new Error("Invalid YAML structure. Expected root object.");
   }
   const root = data as Record<string, unknown>;
-  if (!Array.isArray(root.commands)) { logger.fatal(`Invalid config in ${source}: 'commands' must be a list.`); Deno.exit(1); }
-  if (!Array.isArray(root.servers)) { logger.fatal(`Invalid config in ${source}: 'servers' must be a list.`); Deno.exit(1); }
+  if (!Array.isArray(root.commands)) {
+    throw new Error("'commands' must be a valid array.");
+  }
+  if (!Array.isArray(root.servers)) {
+    throw new Error("'servers' must be a valid array.");
+  }
 }
 
-function listAvailableCommands(parsedData: YamlConfig, options: { server?: string; tag?: string; }): void {
-  // Simplified for brevity - assumes logic is intact
-  logger.info("Listing available commands...");
-  parsedData.commands.forEach((cmd) => {
-    logger.info(`Command: ${cmd.name} [Tags: ${cmd.tags.join(", ")}]`);
-  });
+async function loadConfig(isInitialLoad = false) {
+  try {
+    const rawYaml = await Deno.readTextFile(DAEMON_STATE.configPath);
+    const parsed = parseYaml(rawYaml);
+    validateYamlConfig(parsed);
+    DAEMON_STATE.parsedConfig = parsed;
+    
+    if (isInitialLoad) {
+      logger.info(`[CONFIG] Initial configuration loaded from ${DAEMON_STATE.configPath}`);
+    } else {
+      logger.info(`[CONFIG] Hot-reload successful. Engine updated seamlessly.`);
+    }
+  } catch (e: any) {
+    if (isInitialLoad) { 
+      logger.fatal(`[CONFIG] Initial load failed: ${e.message}`); 
+      Deno.exit(1); 
+    } else {
+      logger.error(`[CONFIG] Hot-reload failed: ${e.message}. Retaining previous valid configuration.`);
+    }
+  }
 }
 
-function listAvailableServers(parsedData: YamlConfig, options: { server?: string; tag?: string; }): void {
-  logger.info("Listing available servers...");
-  parsedData.servers.forEach((server) => {
-    logger.info(`Server: ${server.name} (${server.ip}) [Tags: ${server.tags.join(", ")}]`);
-  });
+async function watchConfig() {
+  try {
+    const watcher = Deno.watchFs(DAEMON_STATE.configPath);
+    for await (const event of watcher) {
+      if (event.kind === "modify") {
+        logger.trace(`[CONFIG] File system 'modify' event detected.`);
+        await new Promise(r => setTimeout(r, 200)); 
+        await loadConfig();
+      }
+    }
+  } catch (e: any) { 
+    logger.error(`[CONFIG] Watcher encountered an error: ${e.message}`); 
+  }
 }
 
-// --- MQTT Broadcaster (For TUI Only) ---
+// --- Network Utilities ---
+async function pingHost(server: ServerConfig, signal?: AbortSignal): Promise<boolean> {
+  const isMac = Deno.build.os === "darwin";
+  try {
+    const command = new Deno.Command("ping", { 
+      args: ["-c", "1", "-W", isMac ? "2000" : "2", server.ip], 
+      stdout: "null", 
+      stderr: "null", 
+      signal 
+    });
+    const output = await command.output();
+    return output.success;
+  } catch (_e) { 
+    return true; // Fail-open on OS constraint errors so we don't accidentally block execution
+  } 
+}
+
+// --- WATCHTOWER: Fleet Health Monitoring ---
+async function checkFleetHealth() {
+  if (!DAEMON_STATE.parsedConfig || DAEMON_STATE.isShuttingDown) return;
+  
+  const activeServers = DAEMON_STATE.parsedConfig.servers.filter(s => s.active);
+  if (activeServers.length === 0) return;
+
+  logger.debug(`[WATCHTOWER] Initiating background health sweep of ${activeServers.length} active servers...`);
+  const healthState: Record<string, "Online" | "Offline"> = {};
+  
+  const abortController = new AbortController();
+  // Set a hard 10-second timeout for the entire sweep so it never blocks
+  const sweepWatchdog = setTimeout(() => abortController.abort(), 10000);
+
+  await Promise.all(activeServers.map(async (server) => {
+    try {
+      const isAlive = await pingHost(server, abortController.signal);
+      healthState[server.name] = isAlive ? "Online" : "Offline";
+    } catch (_e) {
+      healthState[server.name] = "Offline";
+    }
+  }));
+
+  clearTimeout(sweepWatchdog);
+
+  if (!DAEMON_STATE.isShuttingDown) {
+    DAEMON_STATE.mqttClient.publish('axon/fleet/health', JSON.stringify({
+      timestamp: Date.now(),
+      status: healthState
+    }), { qos: 1, retain: true });
+    
+    logger.debug(`[WATCHTOWER] Fleet sweep complete. Results published to MQTT.`);
+  }
+}
+
+// --- MQTT Broadcasters (Scoped to Active Job) ---
 function publishState() {
-  const payload = JSON.stringify({ state: APP_STATE.servers, isDryRun: IS_DRY_RUN, isForced: IS_FORCED });
-  APP_STATE.mqttClient.publish(`axon/run/${RUN_ID}/state`, payload, { qos: 1, retain: true });
+  if (!ACTIVE_JOB) return;
+  const payload = JSON.stringify({ 
+    state: ACTIVE_JOB.servers, 
+    isDryRun: !!ACTIVE_JOB.payload.isDryRun, 
+    isForced: !!ACTIVE_JOB.payload.isForced 
+  });
+  DAEMON_STATE.mqttClient.publish(`axon/run/${ACTIVE_JOB.runId}/state`, payload, { qos: 1, retain: true });
 }
 
 function updateServerState(index: number, modifier: (s: ServerStatus) => void) {
-  modifier(APP_STATE.servers[index]);
+  if (!ACTIVE_JOB) return; 
+  modifier(ACTIVE_JOB.servers[index]); 
   publishState();
 }
 
-let TARGET_COMMAND = "";
-let TARGET_CHECK_COMMAND: string | undefined = undefined;
-let TARGET_POST_COMMAND: string | undefined = undefined;
-let TARGET_COMMAND_NAME = "";
-let TARGET_COMMAND_TYPE: "remote" | "local" = "remote";
-let IS_UNATTENDED = false;
-let IS_VERBOSE = false;
-let IS_DRY_RUN = false;
-let IS_FORCED = false;
+function broadcastLog(serverName: string, message: string) {
+  if (!ACTIVE_JOB) return; 
+  DAEMON_STATE.mqttClient.publish(`axon/run/${ACTIVE_JOB.runId}/log/${serverName}`, message, { qos: 0 });
+}
 
-function renderTemplate(template: string, server: ServerConfig, status?: string): string {
+function renderTemplate(template: string, server: ServerConfig, commandName: string, status?: string): string {
   return template
     .replace(/\{\{home\}\}/g, HOME)
     .replace(/\{\{ip\}\}/g, server.ip)
     .replace(/\{\{user\}\}/g, server.user)
     .replace(/\{\{server_name\}\}/g, server.name)
     .replace(/\{\{downloads\}\}/g, DOWNLOADS_DIR)
-    .replace(/\{\{name\}\}/g, TARGET_COMMAND_NAME)
+    .replace(/\{\{name\}\}/g, commandName)
     .replace(/\{\{status\}\}/g, status ?? "");
 }
 
-async function pingHost(server: ServerConfig): Promise<boolean> {
-  const isMac = Deno.build.os === "darwin";
-  try {
-    const command = new Deno.Command("ping", { 
-      args: ["-c", "1", "-W", isMac ? "2000" : "2", server.ip], 
-      stdout: "null", stderr: "null", signal: APP_STATE.abortController.signal 
-    });
-    return (await command.output()).success;
-  } catch (_e) { return true; }
-}
-
-async function gracefulShutdown(reason: string): Promise<never> {
-  if (APP_STATE.isShuttingDown) await new Promise(() => {});
-  APP_STATE.isShuttingDown = true;
-  
-  logger.info(`Initiating graceful shutdown. Reason: ${reason}`);
-  APP_STATE.abortController.abort();
-
-  // CYANIDE PILL: Prevent process deadlock if MQTT or standard output hangs
-  const failsafe = setTimeout(() => {
-    logger.fatal("Shutdown deadlock detected. Forcing process exit.");
-    Deno.exit(APP_STATE.servers.some(s => s.status === "Failed") ? 1 : 0);
-  }, 3000);
-
-  if (reason === "SIGINT" || reason === "Global Timeout") {
-    const finalState = reason === "SIGINT" ? "Aborted" : "Timeout";
-    const finalMessage = reason === "SIGINT" ? "Process aborted by user." : "Execution timed out.";
-    
-    APP_STATE.servers.forEach((s, index) => {
-      if (["Queued", "Pinging", "Checking SSH", "Checking State", "Running"].includes(s.currentPhase)) {
-        updateServerState(index, (srv) => {
-          srv.status = finalState; srv.currentPhase = finalState; srv.outputBuffer.push(finalMessage);
-        });
-      }
-    });
-  }
-
-  const exitContributors = APP_STATE.servers.filter(s => s.status !== "Success" && s.status !== "Skipped");
-  const skippedCount = APP_STATE.servers.filter(s => s.status === "Skipped").length;
-  const totalFailures = exitContributors.length;
-  const exitCode = Math.min(totalFailures, 255);
-
-  const runLogPath = `${LOG_DIR}/${RUN_ID}.json`;
-
-  const summaryPayload = {
-    status: "completed",
-    exitCode,
-    runLogPath,
-    totalTargets: APP_STATE.servers.length,
-    success: APP_STATE.servers.length - totalFailures - skippedCount,
-    skipped: skippedCount,
-    failures: totalFailures,
-    reason: reason,
-    failedServers: exitContributors.map(s => ({ name: s.config.name, status: s.status }))
-  };
-
-  try {
-    await APP_STATE.mqttClient.publishAsync(`axon/run/${RUN_ID}/status`, JSON.stringify(summaryPayload), { qos: 1, retain: true });
-    await Deno.writeTextFile(runLogPath, JSON.stringify(APP_STATE.servers, null, 2));
-    
-    logger.debug("Disconnecting MQTT client...");
-    await APP_STATE.mqttClient.endAsync(true); // Force close to prevent hanging TCP sockets
-  } catch (e) {
-    logger.error("Error during teardown sequence:", e);
-  }
-
-  clearTimeout(failsafe);
-  
-  logger.info(`Daemon execution complete. Exit code: ${exitCode}`);
-  logger.info(`Persistent Audit Log: ${runLogPath}`);
-  Deno.exit(exitCode);
-}
-
-Deno.addSignalListener("SIGINT", () => gracefulShutdown("SIGINT"));
-
+// --- The Execution Engine (Per-Server) ---
 async function executeServerTask(index: number): Promise<void> {
-  const server = APP_STATE.servers[index];
-  if (APP_STATE.isShuttingDown) return;
-  if (server.status === "Skipped" || server.status === "Offline" || server.status === "Aborted" || server.status === "Timeout") return;
+  const job = ACTIVE_JOB;
+  if (!job || DAEMON_STATE.isShuttingDown) return;
+  
+  const server = job.servers[index];
+  if (["Skipped", "Offline", "Aborted", "Timeout"].includes(server.status)) return;
 
   updateServerState(index, s => { s.currentPhase = "Pinging"; });
-  logger.info(`[${server.config.name}] Starting Task: ${TARGET_COMMAND_NAME}`);
+  logger.info(`[${server.config.name}] Starting Task: ${job.cmdConfig.name}`);
 
-  logger.trace(`[${server.config.name}] Executing ICMP Ping...`);
-  if (!(await pingHost(server.config))) {
-    logger.warn(`[${server.config.name}] Host unreachable (ping failed).`);
-    updateServerState(index, s => { s.status = "Offline"; s.outputBuffer.push("Host unreachable (ping failed)."); });
+  if (!(await pingHost(server.config, job.abortController.signal))) {
+    logger.warn(`[${server.config.name}] Host unreachable.`);
+    updateServerState(index, s => { 
+      s.status = "Offline"; 
+      s.outputBuffer.push("Host unreachable."); 
+    });
     return;
   }
 
-  if (APP_STATE.isShuttingDown) return;
+  if (DAEMON_STATE.isShuttingDown || job.abortController.signal.aborted) return;
+  
   const sshArgs = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10", `${server.config.user}@${server.config.ip}`];
 
-  if (TARGET_COMMAND_TYPE !== "local") {
+  if ((job.cmdConfig.type || "remote") !== "local") {
     updateServerState(index, s => { s.currentPhase = "Checking SSH"; });
-    logger.trace(`[${server.config.name}] Authenticating SSH...`);
     try {
-      const authCmd = new Deno.Command("ssh", { args: [...sshArgs, "exit"], stdout: "null", stderr: "null", signal: APP_STATE.abortController.signal });
+      const authCmd = new Deno.Command("ssh", { 
+        args: [...sshArgs, "exit"], 
+        stdout: "null", 
+        stderr: "null", 
+        signal: job.abortController.signal 
+      });
       if (!(await authCmd.output()).success) {
-        logger.error(`[${server.config.name}] Auth failed. Missing/invalid SSH keys.`);
-        updateServerState(index, s => { s.status = "Failed"; s.outputBuffer.push("Auth failed. Missing/invalid SSH keys."); });
+        updateServerState(index, s => { 
+          s.status = "Failed"; 
+          s.outputBuffer.push("Auth failed."); 
+        });
         return;
       }
     } catch (_e) {
-      if (!APP_STATE.isShuttingDown) {
-        logger.error(`[${server.config.name}] SSH connection dropped.`);
-        updateServerState(index, s => { s.status = "Failed"; s.outputBuffer.push("SSH connection dropped."); });
+      if (!DAEMON_STATE.isShuttingDown) {
+        updateServerState(index, s => { 
+          s.status = "Failed"; 
+          s.outputBuffer.push("SSH connection dropped."); 
+        });
       }
       return;
     }
   }
 
-  const renderedCommand = renderTemplate(TARGET_COMMAND, server.config);
+  if (DAEMON_STATE.isShuttingDown || job.abortController.signal.aborted) return;
 
-  if (IS_DRY_RUN) {
-    logger.info(`[${server.config.name}] [DRY RUN] Would execute: ${renderedCommand}`);
+  if (job.cmdConfig.check_command && !job.payload.isForced) {
+    updateServerState(index, s => { s.currentPhase = "Checking State"; });
+    const renderedCheck = renderTemplate(job.cmdConfig.check_command, server.config, job.cmdConfig.name);
+    try {
+      const checkCmd = (job.cmdConfig.type || "remote") === "local" 
+        ? new Deno.Command("sh", { args: ["-c", renderedCheck], stdout: "null", stderr: "null", signal: job.abortController.signal })
+        : new Deno.Command("ssh", { args: [...sshArgs, renderedCheck], stdout: "null", stderr: "null", signal: job.abortController.signal });
+
+      if ((await checkCmd.output()).success) {
+        updateServerState(index, s => { 
+          s.status = "Skipped"; 
+          s.currentPhase = "Success"; 
+          s.outputBuffer.push("State already met. Skipped."); 
+        });
+        return;
+      }
+    } catch (_e) {}
+  }
+
+  const renderedCommand = renderTemplate(job.cmdConfig.command, server.config, job.cmdConfig.name);
+
+  if (job.payload.isDryRun) {
     updateServerState(index, s => { 
-      s.status = "Success"; s.currentPhase = "Success"; s.outputBuffer.push(`[DRY RUN] Would execute:`, renderedCommand); 
+      s.status = "Success"; 
+      s.currentPhase = "Success"; 
+      s.outputBuffer.push(`[DRY RUN] Would execute:`, renderedCommand); 
     });
     return;
   }
 
   updateServerState(index, s => { s.currentPhase = "Running"; });
-  logger.trace(`[${server.config.name}] Spawning process: ${renderedCommand}`);
   
   try {
-    const command = TARGET_COMMAND_TYPE === "local"
-      ? new Deno.Command("sh", { args: ["-c", renderedCommand], stdout: "piped", stderr: "piped", signal: APP_STATE.abortController.signal })
-      : new Deno.Command("ssh", { args: [...sshArgs, renderedCommand], stdout: "piped", stderr: "piped", signal: APP_STATE.abortController.signal });
+    const command = (job.cmdConfig.type || "remote") === "local"
+      ? new Deno.Command("sh", { args: ["-c", renderedCommand], stdout: "piped", stderr: "piped", signal: job.abortController.signal })
+      : new Deno.Command("ssh", { args: [...sshArgs, renderedCommand], stdout: "piped", stderr: "piped", signal: job.abortController.signal });
 
     const child = command.spawn();
 
@@ -283,132 +308,249 @@ async function executeServerTask(index: number): Promise<void> {
       let partial = "";
       try {
         while (true) {
-          if (APP_STATE.isShuttingDown) break;
+          if (DAEMON_STATE.isShuttingDown || job.abortController.signal.aborted) break;
           const { value, done } = await reader.read();
           if (done) break;
+          
           const lines = (partial + decoder.decode(value, { stream: true })).split("\n");
           partial = lines.pop() ?? "";
+          
           for (const line of lines) {
             if (line.trim()) {
               updateServerState(index, s => { s.outputBuffer.push(line); });
-              // Delegate verbose stream output strictly to the custom logger
-              if (IS_VERBOSE) {
-                logger.debug(`[${server.config.name}] ${isErr ? "STDERR" : "STDOUT"}: ${line.trim()}`);
-              }
+              broadcastLog(server.config.name, `${isErr ? "[STDERR]" : "[STDOUT]"} ${line.trim()}`);
             }
           }
         }
-      } catch (_e) {} finally { reader.releaseLock(); }
+      } catch (_e) {
+        // Stream read error
+      } finally { 
+        reader.releaseLock(); 
+      }
     };
 
-    await Promise.all([readStream(child.stdout, false), readStream(child.stderr, true)]);
-    if (APP_STATE.isShuttingDown) { try { child.kill("SIGTERM"); } catch (_) {} return; }
-
-    logger.trace(`[${server.config.name}] Waiting for child process to resolve...`);
-    const success = (await child.status).success;
+    await Promise.all([
+      readStream(child.stdout, false), 
+      readStream(child.stderr, true)
+    ]);
     
-    if (success) {
-      logger.info(`[${server.config.name}] Command completed successfully.`);
-      updateServerState(index, s => { s.status = "Success"; s.currentPhase = "Success"; });
-    } else {
-      logger.warn(`[${server.config.name}] Command returned non-zero exit code.`);
-      updateServerState(index, s => { s.status = "Failed"; s.currentPhase = "Failed"; });
+    if (DAEMON_STATE.isShuttingDown || job.abortController.signal.aborted) { 
+      try { child.kill("SIGTERM"); } catch (_) {} 
+      return; 
     }
 
+    const success = (await child.status).success;
+    updateServerState(index, s => { 
+      s.status = success ? "Success" : "Failed"; 
+      s.currentPhase = success ? "Success" : "Failed"; 
+    });
+
   } catch (e: any) {
-    if (!APP_STATE.isShuttingDown) {
-      logger.error(`[${server.config.name}] Execution exception: ${e.message}`);
-      updateServerState(index, s => { s.status = "Failed"; s.currentPhase = "Failed"; s.outputBuffer.push("Command execution failed or aborted."); });
+    if (!DAEMON_STATE.isShuttingDown && !job.abortController.signal.aborted) {
+      updateServerState(index, s => { 
+        s.status = "Failed"; 
+        s.currentPhase = "Failed"; 
+        s.outputBuffer.push("Command execution failed."); 
+      });
     }
   }
 }
 
-async function main() {
-  try {
-    const { options, args } = await new Command()
-      .name("axon_daemon")
-      .version(VERSION)
-      .arguments('<command_name:string>')
-      .option("-c, --config <file:string>", "Path to config", { default: `${HOME}/.axon_config.yml` })
-      .option("-t, --tag <tag:string>", "Target by tag")
-      .option("-s, --server <server:string>", "Target by server name")
-      .option("-u, --unattended", "Run silently (Daemon native)")
-      .option("-v, --verbose", "Enable trace/debug logging via custom logger")
-      .option("-d, --dry-run", "Simulate execution")
-      .option("-f, --force", "Ignore idempotency check")
-      .parse(Deno.args);
+// --- The Job Queue Manager (MULTI-TARGET LOGIC UPGRADE) ---
+async function processQueue() {
+  if (IS_PROCESSING || JOB_QUEUE.length === 0 || !DAEMON_STATE.parsedConfig) return;
+  IS_PROCESSING = true;
 
-    IS_UNATTENDED = !!options.unattended;
-    IS_VERBOSE = !!options.verbose;
-    IS_DRY_RUN = !!options.dryRun;
-    IS_FORCED = !!options.force;
-    TARGET_COMMAND_NAME = args[0];
+  while (JOB_QUEUE.length > 0 && !DAEMON_STATE.isShuttingDown) {
+    const payload = JOB_QUEUE.shift()!;
+    logger.info(`[QUEUE] Processing Job: '${payload.command}'`);
 
-    // Configure the injected logger based on flags
-    setLogLevel(IS_VERBOSE ? "trace" : "info");
-
-    initDirectories();
-    await pruneOldLogs();
-
-    const rawYaml = await Deno.readTextFile(options.config).catch(() => {
-      logger.fatal(`Could not read config file at ${options.config}`);
-      Deno.exit(1);
-    });
-    const parsedData = parseYaml(rawYaml) as YamlConfig;
-    validateYamlConfig(parsedData, options.config);
-    
-    if (TARGET_COMMAND_NAME === "commands") return listAvailableCommands(parsedData, options);
-    if (TARGET_COMMAND_NAME === "servers") return listAvailableServers(parsedData, options);
-
-    const cmdConfig = parsedData.commands.find((c) => c.name === TARGET_COMMAND_NAME || c.aliases?.includes(TARGET_COMMAND_NAME));
-    if (!cmdConfig) { logger.fatal(`Command '${TARGET_COMMAND_NAME}' not found in configuration.`); Deno.exit(1); }
-
-    TARGET_COMMAND = cmdConfig.command;
-    TARGET_CHECK_COMMAND = cmdConfig.check_command;
-    TARGET_POST_COMMAND = cmdConfig.post_command;
-    TARGET_COMMAND_TYPE = cmdConfig.type || "remote";
-
-    let targetServers = parsedData.servers.filter(s => s.active);
-    if (options.server) targetServers = targetServers.filter(s => s.name === options.server);
-    else if (options.tag) targetServers = targetServers.filter(s => s.tags.includes(options.tag!));
-    else targetServers = targetServers.filter(s => s.tags.some(tag => cmdConfig.tags.includes(tag)));
-
-    if (!targetServers.length) { logger.warn(`No active servers found for the requested criteria.`); Deno.exit(0); }
-
-    APP_STATE.servers = targetServers.map(config => ({
-      config, status: "Success", currentPhase: "Queued", outputBuffer: ["Queued for execution."]
-    }));
-
-// Ensure MQTT connects safely, preventing race conditions if it connected instantly
-    logger.debug("Establishing MQTT connection...");
-    if (!APP_STATE.mqttClient.connected) {
-      await new Promise<void>((resolve, reject) => {
-        const timeout = setTimeout(() => reject(new Error(`MQTT Broker Connection Timeout at ${MQTT_BROKER}`)), 5000);
-        APP_STATE.mqttClient.once('connect', () => { clearTimeout(timeout); resolve(); });
-        APP_STATE.mqttClient.once('error', (err) => { clearTimeout(timeout); reject(err); });
-      });
-    } else {
-      logger.trace("MQTT client already connected via background thread.");
+    const cmdConfig = DAEMON_STATE.parsedConfig.commands.find(c => c.name === payload.command || c.aliases?.includes(payload.command));
+    if (!cmdConfig) { 
+      logger.error(`Job Failed: Command '${payload.command}' not found in configuration.`); 
+      continue; 
     }
 
-    APP_STATE.mqttClient.publish(`axon/run/${RUN_ID}/status`, JSON.stringify({ status: "running" }), { retain: true, qos: 1 });
-    APP_STATE.mqttClient.publish(`axon/runs/latest`, JSON.stringify({ run_id: RUN_ID }), { retain: true, qos: 1 });
+    let targetServers = DAEMON_STATE.parsedConfig.servers.filter(s => s.active);
+
+    // MULTI-TARGET LOGIC UPGRADE (Strict Intersection / AND Logic)
+    if (payload.targets && (Array.isArray(payload.targets.servers) || Array.isArray(payload.targets.tags))) {
+      const explicitServers = payload.targets.servers || [];
+      const explicitTags = payload.targets.tags || [];
+      
+      if (explicitServers.length > 0 && explicitTags.length > 0) {
+        // AND Logic: Must be in the explicit server list AND have the requested tags
+        targetServers = targetServers.filter(s => 
+          explicitServers.includes(s.name) && s.tags.some(tag => explicitTags.includes(tag))
+        );
+      } else if (explicitServers.length > 0) {
+        // Only servers specified
+        targetServers = targetServers.filter(s => explicitServers.includes(s.name));
+      } else if (explicitTags.length > 0) {
+        // Only tags specified
+        targetServers = targetServers.filter(s => s.tags.some(tag => explicitTags.includes(tag)));
+      }
+    } else {
+      // Fallback: Run on servers matching the command's default tags
+      targetServers = targetServers.filter(s => s.tags.some(tag => cmdConfig.tags.includes(tag)));
+    }
+
+    if (!targetServers.length) { 
+      logger.warn(`Job Skipped: No active servers match targets for '${payload.command}'.`); 
+      continue; 
+    }
+
+    const runId = `run_${new Date().toISOString().replace(/[-:]/g, "").split(".")[0]}_${Math.floor(Math.random() * 1000)}`;
+    
+    ACTIVE_JOB = {
+      runId, 
+      payload, 
+      cmdConfig, 
+      abortController: new AbortController(),
+      servers: targetServers.map(config => ({ 
+        config, 
+        status: "Success", 
+        currentPhase: "Queued", 
+        outputBuffer: ["Queued for execution."] 
+      }))
+    };
+
+    logger.info(`[JOB STARTED] Run ID: ${runId}`);
+    
+    DAEMON_STATE.mqttClient.publish(`axon/run/${runId}/status`, JSON.stringify({ status: "running" }), { retain: true, qos: 1 });
+    DAEMON_STATE.mqttClient.publish(`axon/runs/latest`, JSON.stringify({ run_id: runId }), { retain: true, qos: 1 });
     publishState();
 
-    logger.info(`Axon Engine running. Connected to ${MQTT_BROKER}`);
-    logger.info(`Run ID: ${RUN_ID}`);
-    if (!IS_UNATTENDED) logger.info(`Execute 'axon_tui' in another terminal to attach view.`);
-    
-    const globalWatchdog = setTimeout(() => gracefulShutdown("Global Timeout"), GLOBAL_TIMEOUT_MS);
+    ACTIVE_JOB.timeoutWatchdog = setTimeout(() => {
+      if (ACTIVE_JOB) { 
+        logger.error(`[TIMEOUT] Job ${runId} exceeded global timeout.`); 
+        ACTIVE_JOB.abortController.abort(); 
+      }
+    }, GLOBAL_TIMEOUT_MS);
 
-    for (let i = 0; i < APP_STATE.servers.length; i += 10) {
-      if (APP_STATE.isShuttingDown) break;
-      await Promise.all(APP_STATE.servers.slice(i, i + 10).map((_, idx) => executeServerTask(i + idx)));
+    for (let i = 0; i < ACTIVE_JOB.servers.length; i += 10) {
+      if (DAEMON_STATE.isShuttingDown || ACTIVE_JOB.abortController.signal.aborted) break;
+      await Promise.all(ACTIVE_JOB.servers.slice(i, i + 10).map((_, idx) => executeServerTask(i + idx)));
     }
 
-    clearTimeout(globalWatchdog);
-    await gracefulShutdown("Completed");
+    clearTimeout(ACTIVE_JOB.timeoutWatchdog);
 
+    const exitContributors = ACTIVE_JOB.servers.filter(s => s.status !== "Success" && s.status !== "Skipped");
+    const skippedCount = ACTIVE_JOB.servers.filter(s => s.status === "Skipped").length;
+    const failures = exitContributors.length;
+    
+    const runLogPath = `${LOG_DIR}/${runId}.json`;
+    const summaryPayload = {
+      status: "completed", 
+      exitCode: Math.min(failures, 255), 
+      runLogPath, 
+      totalTargets: ACTIVE_JOB.servers.length,
+      success: ACTIVE_JOB.servers.length - failures - skippedCount, 
+      skipped: skippedCount, 
+      failures,
+      failedServers: exitContributors.map(s => ({ name: s.config.name, status: s.status }))
+    };
+
+    DAEMON_STATE.mqttClient.publish(`axon/run/${runId}/status`, JSON.stringify(summaryPayload), { qos: 1, retain: true });
+    
+    try { 
+      await Deno.writeTextFile(runLogPath, JSON.stringify(ACTIVE_JOB.servers, null, 2)); 
+    } catch (_e) {
+      logger.error(`Failed to write local log file for run ${runId}`);
+    }
+
+    logger.info(`[JOB COMPLETED] Run ID: ${runId}. Failures: ${failures}`);
+    ACTIVE_JOB = null; 
+  }
+  IS_PROCESSING = false;
+}
+
+// --- Graceful Daemon Teardown ---
+async function gracefulShutdown(reason: string): Promise<never> {
+  if (DAEMON_STATE.isShuttingDown) await new Promise(() => {});
+  DAEMON_STATE.isShuttingDown = true;
+  logger.info(`Initiating daemon shutdown. Reason: ${reason}`);
+  
+  if (ACTIVE_JOB) {
+    ACTIVE_JOB.abortController.abort(); 
+  }
+
+  const failsafe = setTimeout(() => { 
+    logger.fatal("Shutdown deadlock. Forcing exit."); 
+    Deno.exit(1); 
+  }, 3000);
+  
+  try { 
+    await DAEMON_STATE.mqttClient.endAsync(true); 
+  } catch (_e) {
+    // Ignore MQTT disconnect errors on teardown
+  }
+  
+  clearTimeout(failsafe);
+  logger.info(`Daemon terminated.`);
+  Deno.exit(0);
+}
+
+Deno.addSignalListener("SIGINT", () => gracefulShutdown("SIGINT"));
+Deno.addSignalListener("SIGTERM", () => gracefulShutdown("SIGTERM"));
+
+// --- Boot Sequence ---
+async function main() {
+  try {
+    const { options } = await new Command()
+      .name("axon_daemon")
+      .version(VERSION)
+      .option("-c, --config <file:string>", "Path to config", { default: `${HOME}/.axon_config.yml` })
+      .option("-v, --verbose", "Enable trace/debug logging via custom logger")
+      .parse(Deno.args);
+
+    setLogLevel(options.verbose ? "trace" : "info");
+    initDirectories();
+    DAEMON_STATE.configPath = options.config;
+    
+    await loadConfig(true);
+    watchConfig().catch(e => logger.error(`[CONFIG] Watcher failed: ${e.message}`));
+
+    logger.debug("Establishing MQTT connection...");
+    if (!DAEMON_STATE.mqttClient.connected) {
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error(`MQTT Timeout`)), 5000);
+        DAEMON_STATE.mqttClient.once('connect', () => { 
+          clearTimeout(timeout); 
+          resolve(); 
+        });
+        DAEMON_STATE.mqttClient.once('error', (err) => { 
+          clearTimeout(timeout); 
+          reject(err); 
+        });
+      });
+    }
+
+    DAEMON_STATE.mqttClient.subscribe('axon/control/dispatch', { qos: 1 });
+
+    DAEMON_STATE.mqttClient.on('message', (topic, message) => {
+      if (topic === 'axon/control/dispatch') {
+        try {
+          const payload = JSON.parse(message.toString()) as DispatchPayload;
+          JOB_QUEUE.push(payload);
+          logger.info(`[DISPATCH RECEIVED] Queued '${payload.command}'`);
+          processQueue(); 
+        } catch (e) { 
+          logger.error(`Failed to parse dispatch payload.`); 
+        }
+      }
+    });
+
+    // --- START WATCHTOWER HEARTBEAT ---
+    setInterval(() => {
+      checkFleetHealth().catch(e => logger.error(`[WATCHTOWER] Internal sweep error: ${e.message}`));
+    }, 60 * 1000);
+    // Trigger initial sweep immediately upon boot
+    checkFleetHealth();
+
+    logger.info(`Axon Control Plane running. Connected to ${MQTT_BROKER}`);
+    
+    await new Promise(() => {}); // Keep alive
   } catch (error: any) {
     logger.fatal(`Critical Exception: ${error.message}`);
     Deno.exit(1);

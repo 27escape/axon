@@ -7,7 +7,7 @@
 
 const VERSION = "10.0.1";
 
-import { colors, Command, parseYaml } from "./deps.ts";
+import { Command, parseYaml } from "./deps.ts";
 import mqtt from "npm:mqtt@^5.5.0";
 import { logger, setLogLevel, setLogFile } from "../various_tools/lib/logger.ts";
 
@@ -411,7 +411,7 @@ async function processQueue() {
         config, 
         status: "Success", 
         currentPhase: "Queued", 
-        outputBuffer: ["Queued for execution."] 
+        outputBuffer: [ `${cmdConfig.name}: queued for execution.`] 
       }))
     };
 

@@ -3,7 +3,18 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Axon Control Plane</title>
+  <link rel="icon" type="image/x-icon" href="/favicon.ico" sizes="any">
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Axon">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+
+  <link rel="manifest" href="/manifest.json">
+  <meta name="theme-color" content="#1e1e1e">
+
+  <title>Axon // Control</title>
   <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
   <style>
     :root { --bg: #1e1e1e; --panel: #2d2d2d; --text: #d4d4d4; --green: #4CAF50; --red: #F44336; --cyan: #00bcd4; --dark: #111; }
@@ -25,7 +36,24 @@
 
     /* --- Dashboard Layout --- */
     header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #444; padding-bottom: 10px; margin-bottom: 20px; }
-    h1 { color: var(--cyan); margin: 0; font-size: 1.5rem; }
+    /* Update the H1 to use Flexbox for perfect vertical alignment */
+    h1 { 
+      color: var(--cyan); 
+      margin: 0; 
+      font-size: 1.5rem; 
+      display: flex; 
+      align-items: center; 
+      gap: 15px; /* Adds clean spacing between the logo and text */
+    }
+    
+    /* Add the logo sizing rule */
+    .header-logo {
+      height: 2em; /* 2em = Exactly twice the height of the H1 text */
+      width: auto;
+      filter: drop-shadow(0 0 8px rgba(0, 188, 212, 0.4)); /* Optional: Adds a subtle cyan glow */
+    }
+
+
     .header-actions { display: flex; align-items: center; gap: 15px; }
     .status-badge { background: #444; padding: 5px 10px; border-radius: 4px; font-size: 0.9rem; transition: background 0.3s;}
     .secondary-btn { background-color: #555; color: white; border: none; padding: 5px 10px; cursor: pointer; border-radius: 4px; display: none; font-family: inherit;}
@@ -94,7 +122,7 @@
 
   <div id="login-overlay">
     <div class="login-box">
-      <h2>AXON GATEWAY</h2>
+      <h2>AXON // CONTROL</h2>
       <input type="text" id="username" placeholder="Username" autocomplete="off" />
       <input type="password" id="password" placeholder="Password" />
       <button id="login-btn" onclick="attemptLogin()">Connect</button>
@@ -103,7 +131,7 @@
   </div>
 
   <header>
-    <h1>AXON // Control Plane</h1>
+    <h1><img src="/favicon.svg" alt="Axon Logo" class="header-logo">AXON // Control</h1>
     <div class="header-actions">
       <div id="conn-status" class="status-badge">Disconnected</div>
       <button id="edit-config-btn" class="secondary-btn" onclick="openConfigManager()">Manager</button>
@@ -117,8 +145,7 @@
       <div class="matrix-col-header">
         <span>1. FILTER BY TAG</span>
         <div style="display: flex; gap: 5px;">
-          <button class="matrix-btn-small cyan" onclick="selectAllTags()">Select All</button>
-          <button class="matrix-btn-small" onclick="clearTags()">Clear</button>
+          <button id="toggle-tags-btn" class="matrix-btn-small cyan" onclick="toggleAllTags()">Select All</button>
         </div>
       </div>
       <div id="matrix-tags" class="matrix-list"></div>
@@ -128,8 +155,7 @@
       <div class="matrix-col-header">
         <span>2. SELECT SERVERS</span>
         <div style="display: flex; gap: 5px;">
-          <button class="matrix-btn-small cyan" onclick="selectAllServers()">Select All</button>
-          <button class="matrix-btn-small" onclick="clearServers()">Clear</button>
+          <button id="toggle-servers-btn" class="matrix-btn-small cyan" onclick="toggleAllServers()">Select All</button>
         </div>
       </div>
       <div id="matrix-servers" class="matrix-list"></div>
@@ -209,6 +235,7 @@
     let currentPass = null;
     let systemConfig = null;
     let currentTab = 'servers';
+    const SESSION_TIMEOUT_MS = 300 * 60 * 1000; // 5 hours
     
     // Matrix State & Watchtower State
     let activeTags = new Set();
@@ -220,7 +247,7 @@
     function resetIdleTimer() { 
       clearTimeout(idleTimer); 
       if (currentUser) {
-        idleTimer = setTimeout(() => logout("Session Expired"), 5 * 60 * 1000); 
+        idleTimer = setTimeout(() => logout("Session Expired"), SESSION_TIMEOUT_MS); 
       }
     }
     
@@ -341,141 +368,134 @@
       }
     }
 
-    // --- MATRIX DECK LOGIC (Strict AND Logic + Intelligent Bulk Selections) ---
-    
-    function clearTags() { 
-      activeTags.clear(); 
-      renderMatrix(); 
-    }
-    
-    function clearServers() { 
-      activeServers.clear(); 
-      renderMatrix(); 
-    }
-    
-    function toggleTag(t) { 
-      activeTags.has(t) ? activeTags.delete(t) : activeTags.add(t); 
-      renderMatrix(); 
-    }
-    
-    function toggleServer(s) { 
-      activeServers.has(s) ? activeServers.delete(s) : activeServers.add(s); 
-      renderMatrix(); 
-    }
+    // --- MATRIX DECK LOGIC ---
 
-    function selectAllTags() {
-      let targetPool = systemConfig.servers;
-      // Intelligently select all tags that apply to the currently selected servers
+    function toggleTag(t) {
+      activeTags.has(t) ? activeTags.delete(t) : activeTags.add(t);
+      // Deselect servers that no longer match the updated tag filter.
       if (activeServers.size > 0) {
-        targetPool = systemConfig.servers.filter(s => activeServers.has(s.name));
+        const nowEligible = new Set(
+          systemConfig.servers
+            .filter(s => activeTags.size === 0 || s.tags.some(t => activeTags.has(t)))
+            .map(s => s.name)
+        );
+        activeServers.forEach(name => { if (!nowEligible.has(name)) activeServers.delete(name); });
       }
-      targetPool.forEach(s => {
-        s.tags.forEach(t => activeTags.add(t));
-      });
       renderMatrix();
     }
 
-    function selectAllServers() {
-      let targetPool = systemConfig.servers;
-      // Intelligently select all servers that match the currently selected tags
-      if (activeTags.size > 0) {
-        targetPool = systemConfig.servers.filter(s => s.tags.some(t => activeTags.has(t)));
+    function toggleServer(s) {
+      activeServers.has(s) ? activeServers.delete(s) : activeServers.add(s);
+      renderMatrix();
+    }
+
+    function toggleAllTags() {
+      // Visible tags = all tags across all servers (tag column always shows everything).
+      const allTags = new Set();
+      systemConfig.servers.forEach(s => s.tags.forEach(t => allTags.add(t)));
+      const allSelected = allTags.size > 0 && [...allTags].every(t => activeTags.has(t));
+      if (allSelected) {
+        activeTags.clear();
+        activeServers.clear();
+      } else {
+        allTags.forEach(t => activeTags.add(t));
+        // Don't auto-select servers — user does that in step 2.
       }
-      // Only select servers that are currently Online
-      targetPool.forEach(s => {
-        if (fleetHealth[s.name] === 'Online') {
-          activeServers.add(s.name);
-        }
+      renderMatrix();
+    }
+
+    function toggleAllServers() {
+      // Eligible: servers matching any active tag (OR), and online.
+      const eligible = systemConfig.servers.filter(s => {
+        const matchesTags = activeTags.size === 0 || s.tags.some(t => activeTags.has(t));
+        return matchesTags && fleetHealth[s.name] === 'Online';
       });
+      const allSelected = eligible.length > 0 && eligible.every(s => activeServers.has(s.name));
+      activeServers.clear();
+      if (!allSelected) eligible.forEach(s => activeServers.add(s.name));
       renderMatrix();
     }
 
     function renderMatrix() {
       if (!systemConfig || currentUser !== 'axon_admin') return;
-      
+
       document.getElementById('matrix-deck').style.display = 'grid';
       document.getElementById('edit-config-btn').style.display = 'block';
 
-      const tagContainer = document.getElementById('matrix-tags');
+      const tagContainer    = document.getElementById('matrix-tags');
       const serverContainer = document.getElementById('matrix-servers');
-      const cmdContainer = document.getElementById('matrix-commands');
-      
-      tagContainer.innerHTML = ''; 
-      serverContainer.innerHTML = ''; 
+      const cmdContainer    = document.getElementById('matrix-commands');
+
+      tagContainer.innerHTML = '';
+      serverContainer.innerHTML = '';
       cmdContainer.innerHTML = '';
 
-      const hasExplicitTargets = activeTags.size > 0 || activeServers.size > 0;
+      // ── Tag filtering uses OR: a server is eligible if it carries ANY selected tag.
+      //    No tags selected → all servers eligible.
+      const tagFilteredServers = activeTags.size > 0
+        ? systemConfig.servers.filter(s => s.tags.some(t => activeTags.has(t)))
+        : systemConfig.servers;
 
-      // Determine the Active Target Pool using STRICT INTERSECTION (AND)
-      let targetPool = systemConfig.servers;
-      
-      if (activeTags.size > 0 && activeServers.size > 0) {
-        // Must match a selected tag AND be a selected server
-        targetPool = systemConfig.servers.filter(s => activeServers.has(s.name) && s.tags.some(t => activeTags.has(t)));
-      } else if (activeServers.size > 0) {
-        targetPool = systemConfig.servers.filter(s => activeServers.has(s.name));
-      } else if (activeTags.size > 0) {
-        targetPool = systemConfig.servers.filter(s => s.tags.some(t => activeTags.has(t)));
-      }
+      // ── Server filtering: only explicitly selected servers narrow the dispatch pool.
+      //    No servers selected → all tag-eligible servers are in the pool.
+      const targetPool = activeServers.size > 0
+        ? tagFilteredServers.filter(s => activeServers.has(s.name))
+        : tagFilteredServers;
 
-      // Gather tags present in the finalized target pool
+      // Tags present across the final dispatch pool (drives command visibility).
       const poolTags = new Set();
       targetPool.forEach(s => s.tags.forEach(t => poolTags.add(t)));
 
-      // Gather all possible tags to iterate over
+      // ── 1. Tags column — always show every tag in the system.
       const allTags = new Set();
       systemConfig.servers.forEach(s => s.tags.forEach(t => allTags.add(t)));
 
-      // 1. Render Tags Column
+      const allTagsSelected = allTags.size > 0 && [...allTags].every(t => activeTags.has(t));
+      const tagsBtn = document.getElementById('toggle-tags-btn');
+      if (tagsBtn) tagsBtn.textContent = allTagsSelected ? 'Clear' : 'Select All';
+
       allTags.forEach(t => {
         const isSelected = activeTags.has(t);
-        const isDimmed = !isSelected && hasExplicitTargets && !poolTags.has(t);
-        
         const div = document.createElement('div');
-        div.className = `matrix-item ${isSelected ? 'selected' : ''} ${isDimmed ? 'dimmed' : ''}`;
+        div.className = `matrix-item ${isSelected ? 'selected' : ''}`;
         div.innerHTML = `<input type="checkbox" ${isSelected ? 'checked' : ''} style="margin-right:10px; pointer-events:none;"> ${t}`;
         div.onclick = () => toggleTag(t);
         tagContainer.appendChild(div);
       });
 
-      // 2. Render Servers Column (WITH HEALTH WATCHTOWER)
-      systemConfig.servers.forEach(s => {
+      // ── 2. Servers column — show only servers that pass the tag filter.
+      const onlineEligible = tagFilteredServers.filter(s => fleetHealth[s.name] === 'Online');
+      const allServersSelected = onlineEligible.length > 0 && onlineEligible.every(s => activeServers.has(s.name));
+      const serversBtn = document.getElementById('toggle-servers-btn');
+      if (serversBtn) serversBtn.textContent = allServersSelected ? 'Clear' : 'Select All';
+
+      tagFilteredServers.forEach(s => {
         const isSelected = activeServers.has(s.name);
-        const isInPool = targetPool.some(ts => ts.name === s.name);
-        
-        // Fetch health status from Watchtower logic
-        const status = fleetHealth[s.name] || 'Offline';
-        const isOnline = status === 'Online';
-        
-        // A server is dimmed if it's filtered out by tags OR if it's currently offline
-        const isDimmed = (!isSelected && hasExplicitTargets && !isInPool) || !isOnline;
-        
+        const isOnline   = fleetHealth[s.name] === 'Online';
+
         const div = document.createElement('div');
-        div.className = `matrix-item ${isSelected ? 'selected' : ''} ${isDimmed ? 'dimmed' : ''}`;
-        
-        const dotClass = isOnline ? 'status-online' : 'status-offline';
-        div.innerHTML = `<span class="status-dot ${dotClass}"></span><input type="checkbox" ${isSelected ? 'checked' : ''} style="margin-right:10px; pointer-events:none;"> ${s.name}`;
-        
+        div.className = `matrix-item ${isSelected ? 'selected' : ''} ${!isOnline ? 'dimmed' : ''}`;
+        div.innerHTML = `<span class="status-dot ${isOnline ? 'status-online' : 'status-offline'}"></span>`
+                      + `<input type="checkbox" ${isSelected ? 'checked' : ''} style="margin-right:10px; pointer-events:none;"> ${s.name}`;
         div.onclick = () => {
-          if (!isOnline) {
-            alert(`Cannot select ${s.name}. Watchtower reports it is Offline.`);
-            return;
-          }
+          if (!isOnline) { alert(`Cannot select ${s.name}. Watchtower reports it is Offline.`); return; }
           toggleServer(s.name);
         };
         serverContainer.appendChild(div);
       });
 
-      // 3. Render Commands Column
+      // ── 3. Commands column — show commands whose tags overlap with the pool's tags.
+      //    Commands with no tags are always shown.
+      //    If nothing is selected at all, show every command.
+      const hasTargets = activeTags.size > 0 || activeServers.size > 0;
       systemConfig.commands.forEach(cmd => {
-        const isValid = !hasExplicitTargets || cmd.tags.some(t => poolTags.has(t));
-        
+        const isVisible = !hasTargets || cmd.tags.length === 0 || cmd.tags.some(t => poolTags.has(t));
+        if (!isVisible) return;
+
         const div = document.createElement('div');
-        div.className = `matrix-item cmd-item ${!isValid ? 'dimmed' : ''}`;
-        div.innerHTML = `${cmd.name}`;
-        div.onclick = () => {
-          if (isValid) dispatchMatrixCommand(cmd.name);
-        };
+        div.className = 'matrix-item cmd-item';
+        div.innerHTML = cmd.name;
+        div.onclick = () => dispatchMatrixCommand(cmd.name);
         cmdContainer.appendChild(div);
       });
     }
